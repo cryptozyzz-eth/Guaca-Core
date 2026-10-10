@@ -1,0 +1,163 @@
+import { categoryHits, extractIntent } from './intent.js';
+import type { Inference } from '../inference/types.js';
+
+export interface FastPathPlace {
+  id: string;
+  name: string;
+  category: string;
+  landmarkDescription: string;
+  lat: number;
+  lon: number;
+  /** Minutes since midnight. */
+  openAt: number;
+  closeAt: number;
+  /** 0 verified, 1 corroborated, 2 listed; absent means verified. */
+  tierRank?: number;
+}
+
+export interface FastPathStop {
+  placeId: string;
+  startMin: number;
+  durationMin: number;
+  reasonCode: string;
+}
+
+export interface FastPathPlan {
+  kind: 'FastPathPlan';
+  stops: FastPathStop[];
+}
+
+export type FastPathResult = FastPathPlan | null;
+
+function distanceM(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+export interface RouteOptions {
+  places: readonly FastPathPlace[];
+  category: string;
+  startMin: number;
+  partySize: number;
+  /** Where the traveller is — routing origin. Defaults to the pilot centre. */
+  lat?: number;
+  lon?: number;
+}
+
+/**
+ * Deterministic greedy router — routing is CODE, not LLM guessing (§4.7:
+ * "routing is deterministic code"). Nearest open place first, never
+ * duplicating a stop.
+ */
+export function greedyRoute(options: RouteOptions): FastPathStop[] {
+  // After 23:00 the same-day minute schema cannot express "open for a
+  // full more hour" — requiring closeAt >= startMin+1400s would filter out
+  // EVERY place and turn every late-night "where can I eat now" into a
+  // refusal. Demand openness to the last representable minute instead.
+  const latestNeeded = Math.min(options.startMin + 60, 1439);
+  const open = options.places.filter(
+    (p) => p.category === options.category && p.openAt <= options.startMin && p.closeAt >= latestNeeded,
+  );
+  // Distances are measured from the traveller, not from a hardcoded pilot
+  // coordinate — the bug version always walked you from the town centre.
+  const originLat = options.lat ?? 10.4716;
+  const originLon = options.lon ?? -68.0056;
+  // What a local stood in front of comes first; among equals, the nearest.
+  const sorted = [...open].sort(
+    (a, b) =>
+      (a.tierRank ?? 0) - (b.tierRank ?? 0) ||
+      distanceM(a.lat, a.lon, originLat, originLon) -
+      distanceM(b.lat, b.lon, originLat, originLon),
+  );
+  const stops: FastPathStop[] = [];
+  const used = new Set<string>();
+  let t = options.startMin;
+  for (const p of sorted) {
+    if (used.has(p.id)) continue;
+    used.add(p.id);
+    stops.push({
+      placeId: p.id,
+      startMin: t,
+      durationMin: 60,
+      reasonCode: 'NEAREST',
+    });
+    t += 60 + 15;
+    if (stops.length >= Math.max(1, Math.min(4, options.partySize))) break;
+  }
+  return stops;
+}
+
+export interface DeterministicOptions {
+  text: string;
+  language: string;
+  lat: number;
+  lon: number;
+  places: readonly FastPathPlace[];
+  inference: Inference;
+  /**
+   * Minutes past midnight to plan from. Defaults to the wall clock.
+   * Injected by tests so behaviour does not depend on what time the suite
+   * runs — without it, every fast-path test fails outside opening hours.
+   */
+  nowMin?: number;
+  /** Category resolved by the caller (model classifier) when the
+   *  deterministic lexicon did not recognise the question. */
+  categoryOverride?: string;
+  /** Local hours (0..23) with rain likely; open-air categories are not planned into them. */
+  wetHours?: readonly number[];
+  /** Minutes past midnight of sunset; an open-air ask after it is the model's to answer. */
+  sunsetMin?: number;
+}
+
+/**
+ * Deterministic fast path (§7.8): single-topic "right now" questions are
+ * answered by pure ranking + greedy routing with ZERO inference calls. This
+ * serves roughly 60% of answers — the most common interaction survives total
+ * inference failure. Returns null (fall through to the model path) otherwise.
+ */
+export async function answerDeterministic(
+  options: DeterministicOptions,
+): Promise<FastPathResult> {
+  const lexical = extractIntent(options.text);
+  const intent = options.categoryOverride
+    ? { ...lexical, category: options.categoryOverride as typeof lexical.category }
+    : lexical;
+  if (intent.when !== 'now') return null;
+  if (categoryHits(options.text).length > 1) return null;
+
+  // Single-topic: the lexicon must have landed on exactly one category, and
+  // the question must not look like a multi-stop day plan.
+  if (/plan|day|itinerar|ruta|tour|mañana|todo el día/i.test(options.text)) {
+    return null;
+  }
+
+  const categoryPlaces = options.places.filter((p) => p.category === intent.category);
+  if (categoryPlaces.length === 0) return null;
+
+  const now = new Date();
+  const startMin = options.nowMin ?? now.getHours() * 60 + now.getMinutes();
+  // A beach or a walk in the rain is not an answer. If the coming hour is
+  // wet for an open-air category, the model path decides (it can shift
+  // the day around the rain); the fast path only answers dry questions.
+  const openAir = new Set(['beach_water', 'nature_walk', 'market_shop']);
+  if (options.wetHours?.includes(Math.floor(startMin / 60)) && openAir.has(intent.category)) return null;
+  if (options.sunsetMin !== undefined && startMin + 30 >= options.sunsetMin && openAir.has(intent.category)) return null;
+  const stops = greedyRoute({
+    places: options.places,
+    category: intent.category,
+    startMin,
+    partySize: intent.partySize ?? 2,
+    lat: options.lat,
+    lon: options.lon,
+  });
+  if (stops.length === 0) return null;
+
+  return { kind: 'FastPathPlan', stops };
+}

@@ -1,0 +1,2981 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ArrowRight, BadgeCheck, Bell, CalendarRange, Check, ChevronDown, ChevronRight, Clock3, Flag, Globe, Heart, Loader2, LogOut, MapPin, Megaphone, MessageCircle, Navigation, Palmtree, Plus, Radio, RefreshCcw, Route, Search, Send, Share2, Sparkles, Star, Store, Sun, Trash2, TrendingUp, Trophy, UserRound, UsersRound, X } from 'lucide-react'
+import { Avatar, Button, GuacaMap, GuacaMark, Input, categoryIconSvg, formatUpdateTime, useInfoStore, useLanguage, type CountryMarker, type ZoneMarker, type ZoneOutline } from '@guaca/ui'
+import { CARIBBEAN_COUNTRIES, TAXONOMY, type Activity, type ActivityInterestTagType as ActivityInterestTag, type PublicPlaceProfile as PublicProfile } from '@guaca/shared'
+import { PlaceDiscovery, PLACE_ICONS, type DiscoveryMode } from './PlaceDiscovery'
+import { PublicPlaceProfile } from './PublicPlaceProfile'
+import { ActivitiesRail } from './ActivitiesRail'
+import { StayDiscovery } from './StayDiscovery'
+import { ReserveStay } from './ReserveStay'
+import { PlaceObservations } from './PlaceObservations'
+import { PlanInterests } from './PlanInterests'
+import { ItineraryTimeline, type TimelineStop } from './ItineraryTimeline'
+import { TouristReservations } from './TouristReservations'
+import { TouristEntitlement } from './TouristEntitlement'
+import { appCopy } from '../lib/copy'
+import { InstallApp } from './InstallApp'
+import { RailArt } from './RailArt'
+import { MobileViewport } from './MobileViewport'
+import { fetchActivities, fetchReservations, fetchStays, type LoadStatus, type ReservationCard, type StayCard } from '../lib/recordingApi'
+import { categoriesForInterests } from '../lib/recordingUi'
+
+/** Puerto Cabello — the pilot area; also the geolocation fallback. */
+const PILOT_CENTER: [number, number] = [-68.0056, 10.4716]
+const BBOX_HALF_DEG = 0.06 // ~6.5 km — the walkable pilot zone
+const LANDING_URL = process.env.NEXT_PUBLIC_LANDING_URL ?? 'https://guaca.live'
+const appUrl = () => process.env.NEXT_PUBLIC_APP_URL ?? window.location.origin
+
+const THREAD_KEY = 'guaca:thread'
+const PLAN_KEY = 'guaca:plan'
+const INTERESTS_KEY = 'guaca:interests'
+/** Which city the stored conversation belongs to, so an answer written in
+ *  one destination never greets a session opened on another. */
+const THREAD_AREA_KEY = 'guaca:thread-area'
+
+/** ISO code → flag emoji (regional indicators). 'VE' → 🇻🇪. */
+function flagOf(code: string): string {
+  return String.fromCodePoint(...[...code.toUpperCase()].map((c) => 0x1f1e6 + c.charCodeAt(0) - 65))
+}
+
+/** Zoom that fits a zone's span: wider zones (Margarita, Mochima) need a
+ *  wider view than a compact old-town grid. */
+function zoomForSpan(bbox: [number, number, number, number]): number {
+  const spanLat = Math.abs(bbox[3]! - bbox[1]!)
+  const spanLon = Math.abs(bbox[2]! - bbox[0]!)
+  const span = Math.max(spanLat, spanLon)
+  return Math.min(13.5, Math.max(9.5, Math.round(Math.log2(200 / span) * 10) / 10))
+}
+const STATS_KEY = 'guaca:stats'
+const GEO_KEY = 'guaca:geo'
+
+/** Device-local impact counters. Questions are anonymous on the server by
+ *  design (COMPLIANCE.md), so the personal tally lives here, not there. */
+interface LocalStats {
+  asked: number
+  commissioned: number
+}
+
+interface ApiPlace {
+  public_profile?: PublicProfile | null
+  id: string
+  name: string
+  category: string
+  landmark_description: string | null
+  description: string | null
+  lat: number
+  lon: number
+  spotter_name: string | null
+  spotter_photo_url: string | null
+  verified_at: string | null
+  postsCount?: number
+  avgRating?: number | null
+  ratingCount?: number
+  trendBadge?: 'trending' | 'asked_about' | 'fresh' | null
+  public_phone?: string | null
+  public_website?: string | null
+  public_socials?: string[] | null
+  public_address?: string | null
+  public_subcategory?: string | null
+  contact_confirmed_at?: string | null
+  verification_status?: string
+  corroboration?: number
+}
+
+interface CandidatePlace {
+  public_profile?: PublicProfile | null
+  verification_status?: string
+  corroboration?: number
+  id: string
+  name: string
+  category: string
+  lat: number
+  lon: number
+  public_phone?: string | null
+  public_website?: string | null
+  public_socials?: string[] | null
+  public_address?: string | null
+  public_subcategory?: string | null
+}
+
+/** What the API says a refused traveller can do next (see plannerService.refusalOptions). */
+type RefusalOption =
+  | { kind: 'ask' | 'refine'; label: string; text: string; category?: string }
+  | { kind: 'notify' }
+  | { kind: 'mission' }
+interface RefusalContext {
+  reason: string
+  category: string | null
+  coverage: { verifiedNearby: number; inCategory: number }
+  options: RefusalOption[]
+  /** Guaca said it in its own words: show it as a message, not a notice. */
+  spoken?: boolean
+}
+interface MissionState {
+  status: 'sending' | 'commissioned' | 'already_open' | 'budget' | 'no_spotter' | 'needs_approval' | 'declined' | 'failed'
+  spotterName?: string
+  expiresAt?: string
+}
+
+type AskState =
+  | { kind: 'idle' }
+  | { kind: 'asking' }
+  | { kind: 'answer'; text: string; placeIds: string[] }
+  | { kind: 'refusal'; text: string; questionId?: string; refusal?: RefusalContext }
+  | { kind: 'error' }
+
+/** What a local knows right now (see apps/api/src/context.ts). */
+interface AreaNow {
+  localTime: string
+  weather: { tempC: number; rainPct: number; windKmh: number; uv: number; summary: string } | null
+  sea: { waveM: number; swellM: number; seaTempC: number | null; state: 'calm' | 'moderate' | 'rough' } | null
+  sun: { sunrise: string; sunset: string } | null
+  holiday: { name: string; localName: string } | null
+  rates: { currency: string; official: number; parallel: number | null; asOf: string } | null
+  alert: { kind: string; name: string; level: string; distanceKm: number; source: string } | null
+}
+
+interface ChatMsg {
+  id: string
+  role: 'user' | 'guaca'
+  kind?: 'answer' | 'refusal' | 'error' | 'chat' | 'mission' | 'notify' | 'first'
+  text: string
+  /** Guaca spoke first: why, and for an evening check-in, the stops to rate. */
+  trigger?: string
+  checkin?: Array<{ placeId: string; name: string }>
+  /** Which verdicts have been sent for this check-in, by placeId. */
+  verdicts?: Record<string, string>
+  /** A friendly lead-in from the concierge above a grounded answer or refusal. */
+  lead?: string
+  placeIds?: string[]
+  questionId?: string
+  suggestions?: Rec[]
+  refusal?: RefusalContext
+  /** Deterministic notes from the day's context (sea, rain, UV, holiday). */
+  notes?: string[]
+}
+
+interface SavedPlan {
+  question: string
+  text: string
+  placeIds: string[]
+  savedAt: string
+}
+
+/** A server-saved trip (GET /api/trips) — guard-minted stops, shareable. */
+interface ApiTrip {
+  id: string
+  question: string
+  language: string
+  stops: Array<{ placeId: string; dayIndex: number; startMin: number; durationMin: number; reasonCode: string }>
+  shareSlug: string
+  createdAt: string
+}
+
+type TripPaceChoice = 'relaxed' | 'balanced' | 'packed'
+
+/** An area from GET /api/areas — the country→city picker's unit. */
+interface ApiArea {
+  id: string
+  name: string
+  slug: string
+  country: string
+  bbox: [number, number, number, number]
+  verifiedCount: number
+  candidateCount: number
+  zoneCount: number
+  peopleAsking: number
+  askCount: number
+}
+
+/** A grounded follow-up from the trend engine — never model output. */
+interface Rec {
+  placeId: string
+  name: string
+  why: 'trending' | 'asked_about' | 'fresh'
+}
+
+interface Me {
+  email: string
+  language: string
+  propertyName: string | null
+  profile?: { name: string; avatarUrl: string; bioEn: string; bioEs: string; home: string }
+}
+
+interface PlacePost {
+  id: string
+  body: string
+  mediaUrl: string | null
+  createdAt: string
+  visited: boolean
+  rating: number | null
+  author: {
+    kind: 'spotter' | 'traveler'
+    name: string | null
+    level: number
+    photoUrl: string | null
+  }
+}
+
+interface Favorite {
+  placeId: string
+  name: string
+  category: string
+  lat: number
+  lon: number
+}
+
+interface Watch {
+  questionId: string
+  text: string
+  askedAt: string
+}
+
+interface MyPost {
+  id: string
+  body: string
+  media_url: string | null
+  visited: boolean
+  rating: number | null
+  created_at: string
+  place_id: string
+  place_name: string
+  category: string
+}
+
+function mediaPlatform(url: string): string {
+  if (url.includes('tiktok')) return 'TikTok'
+  if (url.includes('instagram')) return 'Instagram'
+  if (url.includes('youtu')) return 'YouTube'
+  return 'Video'
+}
+
+// One taxonomy, drawn from everywhere a category needs a mark — a pin, a
+// candidate dot on the map, a filter chip — instead of three local copies
+// silently drifting apart (this one was missing nightlife_music and
+// practical until it started reading from @guaca/shared).
+const CATEGORY_GLYPH: Record<string, { emoji: string; color: string }> = Object.fromEntries(
+  TAXONOMY.map((t) => [t.category, { emoji: t.emoji, color: t.color }]),
+)
+
+function initials(name: string | null): string {
+  if (!name) return '·'
+  return name
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() ?? '')
+    .join('')
+}
+
+/** crypto.randomUUID only exists in secure contexts (HTTPS/localhost) —
+ *  phones on a LAN IP get plain http, so these local keys need a fallback. */
+function localId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function loadJson<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? (JSON.parse(raw) as T) : null
+  } catch {
+    return null
+  }
+}
+
+function saveJson(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* storage full/blocked — the app still works without persistence */
+  }
+}
+
+type Tab = 'map' | 'guaca' | 'plan' | 'profile' | 'updates'
+
+export function TouristView() {
+  const { updates } = useInfoStore()
+  const { lang, setLang } = useLanguage()
+  const t = appCopy[lang].tourist
+  const [query, setQuery] = useState('')
+  const [askText, setAskText] = useState('')
+  const [activeTab, setActiveTab] = useState<Tab>('map')
+  const [deletingTrip, setDeletingTrip] = useState<string | null>(null)
+  const [tripDeleteError, setTripDeleteError] = useState(false)
+  const [center, setCenter] = useState<[number, number]>(PILOT_CENTER)
+  // A real device fix, or null. `center` falls back to the pilot centre for
+  // display; sending that as evidence let a 5-star "Visited" review be
+  // posted with location denied.
+  const [fix, setFix] = useState<[number, number] | null>(null)
+  const [places, setPlaces] = useState<ApiPlace[]>([])
+  const [askState, setAskState] = useState<AskState>({ kind: 'idle' })
+  const [selected, setSelected] = useState<ApiPlace | null>(null)
+
+  // Guaca AI thread + saved plan, persisted locally on this device.
+  const [thread, setThread] = useState<ChatMsg[]>([])
+  const [guacaText, setGuacaText] = useState('')
+  const [guacaBusy, setGuacaBusy] = useState(false)
+  const [plan, setPlan] = useState<SavedPlan | null>(null)
+  const [unreadFirst, setUnreadFirst] = useState(0)
+  const [trips, setTrips] = useState<ApiTrip[]>([])
+  const [tripText, setTripText] = useState('')
+  const [tripDays, setTripDays] = useState(2)
+  const [tripPace, setTripPace] = useState<TripPaceChoice>('balanced')
+  const [tripBusy, setTripBusy] = useState(false)
+  const [tripErr, setTripErr] = useState(false)
+  const [recs, setRecs] = useState<Rec[]>([])
+  const [planPlaces, setPlanPlaces] = useState<Record<string, ApiPlace>>({})
+  const [me, setMe] = useState<Me | null>(null)
+  const [doubted, setDoubted] = useState<Set<string>>(new Set())
+  const [notified, setNotified] = useState<Set<string>>(new Set())
+  const [catFilter, setCatFilter] = useState<string | null>(null)
+  const [trendOnly, setTrendOnly] = useState(false)
+  const [zoneDemandList, setZoneDemandList] = useState<Array<{ zoneId: string; zoneName: string; peopleCount: number; askCount: number }>>([])
+  const [areas, setAreas] = useState<ApiArea[]>([])
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [openCountry, setOpenCountry] = useState<string | null>('VE')
+  const [selectedAreaId, setSelectedAreaId] = useState<string | null>(null)
+  const [flyNonce, setFlyNonce] = useState(0)
+  /** Where the person actually is (geolocation), independent of map panning. */
+  const [userLatLng, setUserLatLng] = useState<[number, number] | null>(null)
+  const [posts, setPosts] = useState<PlacePost[]>([])
+  const [postsOpen, setPostsOpen] = useState(false)
+  const [postText, setPostText] = useState('')
+  const [postLink, setPostLink] = useState('')
+  const [postRating, setPostRating] = useState(0)
+  const [postBusy, setPostBusy] = useState(false)
+  const [postErr, setPostErr] = useState(false)
+  const [favorites, setFavorites] = useState<Favorite[]>([])
+  const [candidates, setCandidates] = useState<CandidatePlace[]>([])
+  const [selectedCandidate, setSelectedCandidate] = useState<CandidatePlace | null>(null)
+  const [stats, setStats] = useState<LocalStats>({ asked: 0, commissioned: 0 })
+  const [watching, setWatching] = useState<Watch[]>([])
+  const [fulfilled, setFulfilled] = useState(0)
+  const [myPosts, setMyPosts] = useState<MyPost[]>([])
+  const [reported, setReported] = useState<Set<string>>(new Set())
+  const [villaCode, setVillaCode] = useState('')
+  const [villaErr, setVillaErr] = useState(false)
+  const [offline, setOffline] = useState(false)
+  const [placesLoading, setPlacesLoading] = useState(true)
+  const [placesRetry, setPlacesRetry] = useState(0)
+  const placeRequest = useRef(0)
+  const favoritePending = useRef(new Set<string>())
+  const [favoriteError, setFavoriteError] = useState(false)
+  // Play's User Data policy wants a disclosure BEFORE the runtime prompt.
+  const [geoAsked, setGeoAsked] = useState(true)
+  const threadEndRef = useRef<HTMLDivElement | null>(null)
+  const favIds = useMemo(() => new Set(favorites.map((f) => f.placeId)), [favorites])
+  const [discoverMode, setDiscoverMode] = useState<DiscoveryMode>('places')
+  const [interests, setInterests] = useState<ActivityInterestTag[]>([])
+  const [activities, setActivities] = useState<Activity[]>([])
+  const [actStatus, setActStatus] = useState<LoadStatus>('loading')
+  const [actRetry, setActRetry] = useState(0)
+  const [stays, setStays] = useState<StayCard[]>([])
+  const [stayStatus, setStayStatus] = useState<LoadStatus>('loading')
+  const [stayRetry, setStayRetry] = useState(0)
+  const [reservations, setReservations] = useState<ReservationCard[]>([])
+  const [bookStatus, setBookStatus] = useState<LoadStatus>('loading')
+  const [bookRetry, setBookRetry] = useState(0)
+  const [reserveStay, setReserveStay] = useState<StayCard | null>(null)
+
+  // A shared link (?place=<id>) opens straight onto that place.
+  useEffect(() => {
+    const shared = new URLSearchParams(window.location.search).get('place')
+    if (shared) {
+      openPlace(shared)
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // A city link (?area=<slug|id>) picks the destination outright — explicit
+  // entry beats the last saved selection, and replaces it. Read once, before
+  // /api/areas answers, so the initial framing already lands on that city.
+  const linkedAreaRef = useRef<string | null>(null)
+  useEffect(() => {
+    const wanted = new URLSearchParams(window.location.search).get('area')
+    if (wanted) {
+      linkedAreaRef.current = wanted
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [])
+
+  /** City switch: everything on screen that belongs to the previous city —
+   *  the open place sheet, an answer card, the category filter, the
+   *  pilot-anchored suggestions, and the conversation and plan written there
+   *  — goes away, so no Puerto Cabello selection, distance or answer leaks
+   *  into a Cartagena session (or back). The conversation is dropped only
+   *  when the city actually changes: reloading the same city keeps it. */
+  const clearCityState = (areaId: string) => {
+    setSelected(null)
+    setSelectedCandidate(null)
+    setAskState({ kind: 'idle' })
+    setCatFilter(null)
+    setRecs([])
+    setAskText('')
+    setGuacaText('')
+    let seen: string | null = null
+    try { seen = localStorage.getItem(THREAD_AREA_KEY) } catch { /* best-effort */ }
+    if (seen && seen !== areaId) {
+      setThread([])
+      setPlan(null)
+      try {
+        localStorage.removeItem(THREAD_KEY)
+        localStorage.removeItem(PLAN_KEY)
+      } catch { /* best-effort */ }
+    }
+    try { localStorage.setItem(THREAD_AREA_KEY, areaId) } catch { /* best-effort */ }
+  }
+
+  useEffect(() => {
+    setThread(loadJson<ChatMsg[]>(THREAD_KEY) ?? [])
+    setPlan(loadJson<SavedPlan>(PLAN_KEY))
+    setStats(loadJson<LocalStats>(STATS_KEY) ?? { asked: 0, commissioned: 0 })
+    const storedInterests = loadJson<ActivityInterestTag[]>(INTERESTS_KEY) ?? []
+    setInterests(storedInterests.filter((tag) => tag === 'relax' || tag === 'adventure' || tag === 'culture' || tag === 'food'))
+  }, [])
+
+  useEffect(() => {
+    if (catFilter === 'lodging') setDiscoverMode('stays')
+  }, [catFilter])
+
+  useEffect(() => {
+    let cancelled = false
+    setActStatus('loading')
+    void fetchActivities(selectedAreaId).then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        setActStatus('error')
+        return
+      }
+      setActivities(result.activities)
+      setActStatus(result.activities.length > 0 ? 'ready' : 'empty')
+    })
+    return () => { cancelled = true }
+  }, [selectedAreaId, actRetry])
+
+  useEffect(() => {
+    let cancelled = false
+    setStayStatus('loading')
+    void fetchStays({ areaId: selectedAreaId }).then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        setStayStatus('error')
+        return
+      }
+      setStays(result.stays)
+      setStayStatus(result.stays.length > 0 ? 'ready' : 'empty')
+    })
+    return () => { cancelled = true }
+  }, [selectedAreaId, stayRetry])
+
+  useEffect(() => {
+    let cancelled = false
+    if (reservations.length === 0) setBookStatus('loading')
+    void fetchReservations().then((result) => {
+      if (cancelled) return
+      if (!result.ok) {
+        setBookStatus('error')
+        return
+      }
+      setReservations(result.reservations)
+      setBookStatus(result.reservations.length > 0 ? 'ready' : 'empty')
+    })
+    return () => { cancelled = true }
+    // Retry and tab focus refetch. Existing rows stay on screen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookRetry, activeTab])
+
+  useEffect(() => {
+    const pending = reservations.some((row) => row.status === 'requested')
+    if (!pending) return
+    const timer = window.setInterval(() => {
+      void fetchReservations().then((result) => {
+        if (!result.ok) return
+        setReservations((prev) => {
+          const same = prev.length === result.reservations.length
+            && prev.every((row, i) => row.id === result.reservations[i]?.id && row.status === result.reservations[i]?.status)
+          return same ? prev : result.reservations
+        })
+        setBookStatus(result.reservations.length > 0 ? 'ready' : 'empty')
+      })
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [reservations])
+
+  const bumpStats = (refused: boolean) => {
+    setStats((prev) => {
+      const next = {
+        asked: prev.asked + 1,
+        commissioned: prev.commissioned + (refused ? 1 : 0),
+      }
+      saveJson(STATS_KEY, next)
+      return next
+    })
+  }
+
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [thread, guacaBusy])
+
+  // Centre on the guest if they allow it; the pilot area otherwise (§T1.4).
+  // The disclosure runs first: Play requires explaining why we want location
+  // before the system prompt appears.
+  const useMyLocation = () => {
+    setGeoAsked(true)
+    try { localStorage.setItem(GEO_KEY, 'asked') } catch { /* ignore */ }
+    if (!('geolocation' in navigator)) return
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setCenter([pos.coords.longitude, pos.coords.latitude])
+        setFix([pos.coords.longitude, pos.coords.latitude])
+        setUserLatLng([pos.coords.latitude, pos.coords.longitude])
+      },
+      () => setFix(null),
+      { timeout: 5000, maximumAge: 300_000 },
+    )
+  }
+
+  const skipLocation = () => {
+    setGeoAsked(true)
+    try { localStorage.setItem(GEO_KEY, 'skipped') } catch { /* ignore */ }
+  }
+
+  useEffect(() => {
+    let seen: string | null = null
+    try { seen = localStorage.getItem(GEO_KEY) } catch { /* ignore */ }
+    if (!seen) return setGeoAsked(false)
+    if (seen === 'asked' && 'geolocation' in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setCenter([pos.coords.longitude, pos.coords.latitude])
+          setFix([pos.coords.longitude, pos.coords.latitude])
+        },
+        () => setFix(null),
+        { timeout: 5000, maximumAge: 300_000 },
+      )
+    }
+  }, [])
+
+  // Both map layers must arrive together. A failed API is not empty coverage.
+  useEffect(() => {
+    const [lon, lat] = center
+    const bbox = [lon - BBOX_HALF_DEG, lat - BBOX_HALF_DEG, lon + BBOX_HALF_DEG, lat + BBOX_HALF_DEG].join(',')
+    const controller = new AbortController()
+    setPlacesLoading(true)
+    setOffline(false)
+    const read = async (url: string) => {
+      const response = await fetch(url, { credentials: 'include', signal: controller.signal })
+      if (!response.ok) throw new Error('Places unavailable')
+      return response.json()
+    }
+    Promise.all([read(`/api/places?bbox=${bbox}`), read(`/api/places/candidates?bbox=${bbox}`)])
+      .then(([verified, listed]) => {
+        setPlaces(verified.places ?? [])
+        setCandidates(listed.candidates ?? [])
+      })
+      .catch(() => { if (!controller.signal.aborted) setOffline(true) })
+      .finally(() => { if (!controller.signal.aborted) setPlacesLoading(false) })
+    return () => controller.abort()
+  }, [center, placesRetry])
+
+  // Saved places ride the session.
+  // Zone demand — the scheduler's snapshot, SCOPED to the selected area:
+  // the card must talk about where the person is looking, not the world.
+  useEffect(() => {
+    const qs = selectedAreaId ? `?areaId=${encodeURIComponent(selectedAreaId)}` : ''
+    fetch(`/api/zones/demand${qs}`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { zones: typeof zoneDemandList } | null) => {
+        if (d) setZoneDemandList(d.zones.filter((z) => z.peopleCount > 0).slice(0, 4))
+      })
+      .catch(() => {})
+  }, [selectedAreaId])
+
+  useEffect(() => {
+    fetch('/api/tourist/favorites', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { favorites: Favorite[] } | null) => {
+        if (data) setFavorites(data.favorites)
+      })
+      .catch(() => {})
+  }, [])
+
+  // Saved trips for the Plan tab — server-side, per account.
+  useEffect(() => {
+    if (activeTab !== 'plan') return
+    fetch('/api/trips', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { trips: ApiTrip[] } | null) => {
+        if (d) setTrips(d.trips)
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab])
+
+  // Areas for the country→city picker, with the persisted selection. An
+  // ?area= link wins over the saved city, then the pilot stays the default.
+  useEffect(() => {
+    fetch('/api/areas', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { areas: ApiArea[] } | null) => {
+        if (!d) return
+        setAreas(d.areas)
+        try {
+          const linked = linkedAreaRef.current
+            ? d.areas.find((a) => a.slug === linkedAreaRef.current || a.id === linkedAreaRef.current)
+            : undefined
+          const saved = localStorage.getItem('guaca:area')
+          const found = saved ? d.areas.find((a) => a.id === saved) : undefined
+          const pilot = d.areas.find((a) => a.slug === 'puerto-cabello')
+          const chosen = linked ?? found ?? pilot ?? null
+          if (linked) {
+            // The explicit entry becomes the new saved city.
+            try { localStorage.setItem('guaca:area', linked.id) } catch { /* best-effort */ }
+          }
+          setSelectedAreaId(chosen?.id ?? null)
+          if (chosen) {
+            clearCityState(chosen.id)
+            const midLng = (chosen.bbox[0]! + chosen.bbox[2]!) / 2
+            const midLat = (chosen.bbox[1]! + chosen.bbox[3]!) / 2
+            setCenter([midLng, midLat])
+          }
+        } catch { /* best-effort */ }
+      })
+      .catch(() => {})
+  }, [])
+
+  // Grounded recommendations for the chat's opening state — trending
+  // verified places near the pilot centre, honestly badged.
+  useEffect(() => {
+    if (activeTab !== 'guaca' || thread.length > 0 || recs.length > 0) return
+    fetch(`/api/suggestions?lat=${center[1]}&lon=${center[0]}`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { suggestions: Rec[] } | null) => {
+        if (d) setRecs(d.suggestions)
+      })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab])
+
+  // "What locals say" for the open place — fetched eagerly so the toggle
+  // can show a count before it is opened.
+  useEffect(() => {
+    if (!selected) return
+    setPosts([])
+    setPostsOpen(false)
+    setPostText('')
+    setPostLink('')
+    setPostRating(0)
+    setPostErr(false)
+    fetch(`/api/places/${selected.id}/posts`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { posts: PlacePost[] } | null) => {
+        if (data) setPosts(data.posts)
+      })
+      .catch(() => {})
+  }, [selected?.id])
+
+  // Account details, watches and posts for the Profile tab.
+  useEffect(() => {
+    if (activeTab !== 'profile') return
+    fetch('/api/tourist/me', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: Me | null) => {
+        if (data) setMe(data)
+      })
+      .catch(() => {})
+    fetch('/api/tourist/watching', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { pending: Watch[]; fulfilled: number } | null) => {
+        if (d) {
+          setWatching(d.pending)
+          setFulfilled(d.fulfilled)
+        }
+      })
+      .catch(() => {})
+    void takeInbox()
+    fetch('/api/tourist/posts', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { posts: MyPost[] } | null) => {
+        if (d) setMyPosts(d.posts)
+      })
+      .catch(() => {})
+  }, [activeTab])
+
+  // Resolve plan stops outside the current map bbox, and every place an
+  // answer in the thread cites: a plan may name an open-data place the
+  // verified layer does not carry, and its chip still has to open.
+  useEffect(() => {
+    const wanted = new Set<string>([...(plan?.placeIds ?? []), ...thread.flatMap((m) => m.placeIds ?? [])])
+    for (const id of wanted) {
+      if (places.some((p) => p.id === id) || planPlaces[id]) continue
+      fetch(`/api/places/${id}`, { credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((full: ApiPlace | null) => {
+          if (full) setPlanPlaces((prev) => ({ ...prev, [id]: full }))
+        })
+        .catch(() => {})
+    }
+  }, [plan, thread, places, planPlaces])
+
+  const verifiedPins = useMemo(
+    () =>
+      (catFilter ? places.filter((p) => p.category === catFilter) : places)
+        .filter((p) => (trendOnly ? p.trendBadge != null : true))
+        .map((p) => {
+        const glyph = CATEGORY_GLYPH[p.category] ?? { emoji: '📍', color: '#0D8B8B' }
+        return {
+          id: p.id,
+          lat: p.lat,
+          lng: p.lon,
+          emoji: glyph.emoji,
+          label: p.name,
+          spotterColor: glyph.color,
+          spotterInitials: initials(p.spotter_name),
+          verified: true,
+          ...(p.public_profile?.image?.url ? { photoUrl: p.public_profile.image.url } : {}),
+          ...(p.trendBadge ? { trendBadge: p.trendBadge } : {}),
+          ...(p.avgRating != null && (p.ratingCount ?? 0) > 0
+            ? { ratingBadge: p.avgRating.toFixed(1) }
+            : {}),
+        }
+      }),
+    [places, catFilter, trendOnly],
+  )
+
+  // Curated public listings: a researched candidate that carries its own
+  // photo becomes a photo-backed listed marker — an explicit public-listing
+  // treatment with the globe mark, never the verified check, a witness, a
+  // rating or a trend badge. A photo describes a place; it is not
+  // verification evidence.
+  const listedPins = useMemo(
+    () =>
+      (catFilter ? candidates.filter((c) => c.category === catFilter) : candidates)
+        .filter((c) => c.public_profile?.image?.url)
+        .map((c) => {
+          const glyph = CATEGORY_GLYPH[c.category] ?? { emoji: '📍', color: '#0D8B8B' }
+          return {
+            id: c.id,
+            lat: c.lat,
+            lng: c.lon,
+            emoji: glyph.emoji,
+            iconSvg: categoryIconSvg(c.category, 18),
+            label: c.name,
+            spotterColor: glyph.color,
+            spotterInitials: initials(null),
+            verified: false,
+            listed: true,
+            photoUrl: c.public_profile!.image!.url,
+          }
+        }),
+    [candidates, catFilter],
+  )
+
+  const pins = useMemo(() => [...verifiedPins, ...listedPins], [verifiedPins, listedPins])
+
+  // Ordinary unconfirmed candidates stay small dots — and anything promoted
+  // to a listed marker above leaves this layer, so no place renders twice or
+  // competes with itself for the tap.
+  const dots = useMemo(
+    () =>
+      (catFilter ? candidates.filter((c) => c.category === catFilter) : candidates)
+        .filter((c) => !c.public_profile?.image?.url)
+        .map((c) => ({
+          id: c.id,
+          lat: c.lat,
+          lng: c.lon,
+          label: c.name,
+          category: c.category,
+        })),
+    [candidates, catFilter],
+  )
+
+  const selectedArea = useMemo(
+    () => areas.find((a) => a.id === selectedAreaId) ?? null,
+    [areas, selectedAreaId],
+  )
+
+  /** Countries grouped for the picker: live, planned, then the rest. */
+  const pickerGroups = useMemo(() => {
+    const byCountry = new Map<string, ApiArea[]>()
+    for (const a of areas) {
+      const list = byCountry.get(a.country) ?? []
+      list.push(a)
+      byCountry.set(a.country, list)
+    }
+    const order: Array<'live' | 'planned' | 'uncovered'> = ['live', 'planned', 'uncovered']
+    return order.map((status) => ({
+      status,
+      countries: CARIBBEAN_COUNTRIES.filter((c) => c.status === status).map((c) => ({
+        country: c,
+        areas: (byCountry.get(c.code) ?? []).sort((x, y) => y.verifiedCount - x.verifiedCount),
+      })),
+    }))
+  }, [areas])
+
+  /**
+   * Location-aware default: inside the Caribbean basin the picker opens on
+   * the person's own country only (everything else behind "show all");
+   * outside the basin it opens on all countries. The nearest country
+   * marker within ~800km decides which country is "yours".
+   */
+  const nearCountryCode = useMemo(() => {
+    const origin = userLatLng ?? [center[1], center[0]]
+    const [lat, lon] = origin
+    const inBasin = lat > 4 && lat < 29.5 && lon > -101 && lon < -56
+    if (!inBasin) return null
+    let best: { code: string; km: number } | null = null
+    for (const c of CARIBBEAN_COUNTRIES) {
+      const dLat = (c.lat - lat) * 111
+      const dLon = (c.lon - lon) * 111 * Math.cos((lat * Math.PI) / 180)
+      const km = Math.hypot(dLat, dLon)
+      if (!best || km < best.km) best = { code: c.code, km }
+    }
+    return best && best.km < 800 ? best.code : null
+  }, [userLatLng, center])
+
+  const [showAllCountries, setShowAllCountries] = useState(false)
+  const [pickerQuery, setPickerQuery] = useState('')
+  useEffect(() => {
+    // A newly-derived country (geolocation arriving) re-anchors the picker
+    // and collapses show-all back to near-me.
+    if (nearCountryCode) {
+      setOpenCountry(nearCountryCode)
+      setShowAllCountries(false)
+    }
+  }, [nearCountryCode])
+
+  /** The groups the picker renders: search results, near-me only, or
+   *  everything. 35 countries deserve a filter box. */
+  const visiblePickerGroups = useMemo(() => {
+    const q = pickerQuery.trim().toLowerCase()
+    if (q.length > 0) {
+      return pickerGroups
+        .map((g) => ({
+          ...g,
+          countries: g.countries
+            .map((c) => ({
+              ...c,
+              areas: c.country.name.toLowerCase().includes(q) ||
+                c.country.nameEs.toLowerCase().includes(q) ||
+                c.country.code.toLowerCase() === q
+                ? c.areas
+                : c.areas.filter((a) => a.name.toLowerCase().includes(q)),
+            }))
+            .filter((c) => c.areas.length > 0 ||
+              c.country.name.toLowerCase().includes(q) ||
+              c.country.nameEs.toLowerCase().includes(q) ||
+              c.country.code.toLowerCase() === q),
+        }))
+        .filter((g) => g.countries.length > 0)
+    }
+    if (showAllCountries || !nearCountryCode) return pickerGroups
+    return pickerGroups
+      .map((g) => ({
+        ...g,
+        countries: g.countries.filter((c) => c.country.code === nearCountryCode),
+      }))
+      .filter((g) => g.countries.length > 0)
+  }, [pickerGroups, showAllCountries, nearCountryCode, pickerQuery])
+
+  /** Tappable zone pills on the map itself — the picker without the menu. */
+  const zoneMarkers = useMemo<ZoneMarker[]>(
+    () =>
+      areas.map((a) => ({
+        id: a.id,
+        label: a.name,
+        lat: (a.bbox[1]! + a.bbox[3]!) / 2,
+        lng: (a.bbox[0]! + a.bbox[2]!) / 2,
+        selected: a.id === selectedAreaId,
+      })),
+    [areas, selectedAreaId],
+  )
+
+  /** Every zone's boundary on the map — bold-dashed for the selected one,
+   *  subtle for the rest, all tappable (fill click selects). */
+  const zoneOutlines = useMemo<ZoneOutline[]>(
+    () =>
+      areas.map((a) => ({
+        id: a.id,
+        bbox: a.bbox,
+        selected: a.id === selectedAreaId,
+      })),
+    [areas, selectedAreaId],
+  )
+
+  /** A country tap selects its best zone: most verified, else most
+   *  candidates (the most-searched zones were imported first), else first. */
+  const handleCountrySelect = (code: string) => {
+    const inCountry = areas.filter((a) => a.country === code)
+    if (inCountry.length === 0) return // no zones yet: the fly-to is all
+    const best = [...inCountry].sort(
+      (x, y) =>
+        y.verifiedCount - x.verifiedCount || y.candidateCount - x.candidateCount,
+    )[0]!
+    selectArea(best)
+  }
+
+  const handleZoneSelect = (id: string) => {
+    const area = areas.find((a) => a.id === id)
+    if (area && area.id !== selectedAreaId) selectArea(area)
+  }
+
+  const selectArea = (a: ApiArea) => {
+    setPickerOpen(false)
+    if (a.id === selectedAreaId) return
+    clearCityState(a.id)
+    setSelectedAreaId(a.id)
+    try { localStorage.setItem('guaca:area', a.id) } catch { /* best-effort */ }
+    const midLng = (a.bbox[0]! + a.bbox[2]!) / 2
+    const midLat = (a.bbox[1]! + a.bbox[3]!) / 2
+    setCenter([midLng, midLat])
+    setFlyNonce((n) => n + 1)
+  }
+
+  // Country coverage markers — the honest Caribbean-wide layer. One label
+  // per country, each a fact: pilot live, named expansion target, or not
+  // covered yet. Never a place pin.
+  const countryMarkers = useMemo<CountryMarker[]>(
+    () =>
+      CARIBBEAN_COUNTRIES.map((c) => ({
+        code: c.code,
+        label: lang === 'es' ? c.nameEs : c.name,
+        status: c.status,
+        statusLabel:
+          c.status === 'live'
+            ? t.countryLive
+            : c.status === 'planned'
+              ? t.countryPlanned
+              : t.countryUncovered,
+        lat: c.lat,
+        lng: c.lon,
+      })),
+    [lang, t],
+  )
+
+  // Review-activity heat: verified places weighted by their post volume.
+  const heat = useMemo(
+    () =>
+      places
+        .filter((p) => (p.postsCount ?? 0) > 0)
+        .map((p) => ({ lat: p.lat, lng: p.lon, weight: Math.min(p.postsCount ?? 0, 10) })),
+    [places],
+  )
+
+  /** One grounded call for the map box AND the Guaca thread (§7.3). */
+  type AskReply = {
+    kind: 'answer' | 'refusal' | 'chat' | 'mission' | 'notify'
+    text: string
+    lead?: string
+    placeIds: string[]
+    questionId?: string
+    suggestions?: Rec[]
+    refusal?: RefusalContext
+    mission?: { status: string; spotterName?: string; expiresAt?: string; questionId: string }
+    notes?: string[]
+    context?: AreaNow
+  }
+  const askApi = async (text: string, withThread = false): Promise<AskReply | null> => {
+    // The thread rides along so Guaca can converse; the latest refusal lets
+    // "yes, send someone" mean something.
+    const history = withThread ? thread.slice(-8).map((m) => ({ role: m.role, text: m.text })) : []
+    const lastRefusal = withThread ? [...thread].reverse().find((m) => m.kind === 'refusal' && m.questionId) : undefined
+    const res = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ text, language: lang, lat: center[1], lon: center[0], history, lastQuestionId: lastRefusal?.questionId ?? null }),
+    })
+    if (!res.ok) return null
+    return (await res.json()) as AskReply
+  }
+
+  /** The last option on a refusal: ask for a local to be sent, once per question. */
+  const [missions, setMissions] = useState<Record<string, MissionState>>({})
+  const requestMission = async (questionId: string) => {
+    if (missions[questionId] && missions[questionId]!.status !== 'failed') return
+    setMissions((m) => ({ ...m, [questionId]: { status: 'sending' } }))
+    setNotified((prev) => new Set(prev).add(questionId))
+    try {
+      const res = await fetch(`/api/questions/${questionId}/mission`, { method: 'POST', credentials: 'include' })
+      const body = (await res.json().catch(() => ({}))) as { status?: string; spotterName?: string; expiresAt?: string }
+      const status = (res.ok && body.status) ? body.status : 'failed'
+      setMissions((m) => ({ ...m, [questionId]: { status: status as MissionState['status'], ...(body.spotterName ? { spotterName: body.spotterName } : {}), ...(body.expiresAt ? { expiresAt: body.expiresAt } : {}) } }))
+    } catch {
+      setMissions((m) => ({ ...m, [questionId]: { status: 'failed' } }))
+    }
+  }
+
+  const openWindow = (url: string) => window.open(url, '_blank', 'noopener')
+  const waShare = (text: string) => openWindow(`https://wa.me/?text=${encodeURIComponent(text)}`)
+
+  const sharePlace = (p: ApiPlace) =>
+    waShare(
+      `${p.name} — ${t.shareVia}${p.spotter_name ? ` (${t.verifiedBy} ${p.spotter_name})` : ''}. ${appUrl()}/map?place=${p.id}`,
+    )
+
+  const directionsTo = (p: ApiPlace) =>
+    openWindow(`https://www.google.com/maps/dir/?api=1&destination=${p.lat},${p.lon}`)
+
+  /** Prefill the Guaca tab with a question about this place — every tap is
+   *  a demand signal for exactly this spot. */
+  const askAboutPlace = (p: ApiPlace) => {
+    setSelected(null)
+    setGuacaText(t.askAboutPlace.replace('{name}', p.name))
+    setActiveTab('guaca')
+  }
+
+  /** A doubt, not a review: creates re-check demand, publishes nothing. */
+  const doubtPlace = (p: ApiPlace) => {
+    if (doubted.has(p.id)) return
+    setDoubted((prev) => new Set(prev).add(p.id))
+    fetch(`/api/places/${p.id}/doubt`, { method: 'POST', credentials: 'include' }).catch(() => {})
+  }
+
+  const notifyMe = (questionId: string) => {
+    if (notified.has(questionId)) return
+    setNotified((prev) => new Set(prev).add(questionId))
+    fetch(`/api/questions/${questionId}/notify`, { method: 'POST', credentials: 'include' }).catch(
+      () => {},
+    )
+  }
+
+  const addToPlan = (id: string) => {
+    setPlan((prev) => {
+      const next: SavedPlan = prev
+        ? prev.placeIds.includes(id)
+          ? prev
+          : { ...prev, placeIds: [...prev.placeIds, id] }
+        : { question: '', text: '', placeIds: [id], savedAt: new Date().toISOString() }
+      saveJson(PLAN_KEY, next)
+      return next
+    })
+  }
+
+  const addPlacesToPlan = (placeIds: string[]) => {
+    setPlan((prev) => {
+      const existing = prev?.placeIds ?? []
+      const merged = [...existing]
+      for (const id of placeIds) {
+        if (!merged.includes(id)) merged.push(id)
+      }
+      const next: SavedPlan = {
+        question: prev?.question ?? '',
+        text: '',
+        placeIds: merged,
+        savedAt: new Date().toISOString(),
+      }
+      saveJson(PLAN_KEY, next)
+      return next
+    })
+    setActiveTab('plan')
+  }
+
+  const substituteStop = (fromId: string, toId: string) => {
+    setPlan((prev) => {
+      if (!prev) return prev
+      const next: SavedPlan = {
+        ...prev,
+        text: '',
+        placeIds: prev.placeIds.map((id) => (id === fromId ? toId : id)),
+      }
+      saveJson(PLAN_KEY, next)
+      return next
+    })
+  }
+
+  const setInterestsPersist = (next: ActivityInterestTag[]) => {
+    setInterests(next)
+    saveJson(INTERESTS_KEY, next)
+  }
+
+  const removeStop = (id: string) => {
+    setPlan((prev) => {
+      if (!prev) return prev
+      const ids = prev.placeIds.filter((x) => x !== id)
+      if (ids.length === 0) {
+        try { localStorage.removeItem(PLAN_KEY) } catch { /* best-effort */ }
+        return null
+      }
+      // Drop the original narrative once the stops are edited — it still
+      // listed the removed stop, so list and prose disagreed.
+      const next = { ...prev, placeIds: ids, text: '' }
+      saveJson(PLAN_KEY, next)
+      return next
+    })
+  }
+
+  const toggleFavorite = (p: ApiPlace) => {
+    if (favoritePending.current.has(p.id)) return
+    favoritePending.current.add(p.id)
+    setFavoriteError(false)
+    const saved = favIds.has(p.id)
+    setFavorites((prev) =>
+      saved
+        ? prev.filter((f) => f.placeId !== p.id)
+        : [{ placeId: p.id, name: p.name, category: p.category, lat: p.lat, lon: p.lon }, ...prev],
+    )
+    fetch(`/api/places/${p.id}/favorite`, {
+      method: saved ? 'DELETE' : 'POST',
+      credentials: 'include',
+    }).then((response) => { if (!response.ok) throw new Error('Save failed') })
+      .catch(() => {
+        setFavoriteError(true)
+        setFavorites((previous) => saved
+          ? [...previous.filter((f) => f.placeId !== p.id), { placeId: p.id, name: p.name, category: p.category, lat: p.lat, lon: p.lon }]
+          : previous.filter((f) => f.placeId !== p.id))
+      })
+      .finally(() => favoritePending.current.delete(p.id))
+  }
+
+  const submitPost = async () => {
+    if (!selected || postBusy || postText.trim().length === 0) return
+    setPostBusy(true)
+    setPostErr(false)
+    try {
+      const res = await fetch(`/api/places/${selected.id}/posts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          text: postText.trim(),
+          ...(postLink.trim() ? { mediaUrl: postLink.trim() } : {}),
+          ...(postRating > 0 ? { rating: postRating } : {}),
+          ...(fix ? { lat: fix[1], lon: fix[0] } : {}),
+        }),
+      })
+      if (!res.ok) {
+        setPostErr(true)
+        return
+      }
+      setPostText('')
+      setPostLink('')
+      setPostRating(0)
+      const list = await fetch(`/api/places/${selected.id}/posts`, { credentials: 'include' })
+      if (list.ok) setPosts(((await list.json()) as { posts: PlacePost[] }).posts)
+    } catch {
+      setPostErr(true)
+    } finally {
+      setPostBusy(false)
+    }
+  }
+
+  const sharePlanWa = () => {
+    if (!plan) return
+    const stops = plan.placeIds.map((id) => placeById(id)?.name).filter(Boolean).join(' → ')
+    waShare(`${t.planTitle}: ${stops} — ${t.shareVia}. ${appUrl()}`)
+  }
+
+  const savePlanFromAnswer = (question: string, text: string, placeIds: string[]) => {
+    if (placeIds.length === 0) return
+    const next: SavedPlan = { question, text, placeIds, savedAt: new Date().toISOString() }
+    setPlan(next)
+    saveJson(PLAN_KEY, next)
+  }
+
+  /** POST /api/plan — the guarded trip pipeline; a refusal is honest too. */
+  const planTripCall = async () => {
+    const text = tripText.trim()
+    if (!text || tripBusy) return
+    setTripBusy(true)
+    setTripErr(false)
+    try {
+      const res = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          text,
+          language: lang,
+          lat: center[1],
+          lon: center[0],
+          days: tripDays,
+          pace: tripPace,
+          ...(interests.length > 0 ? { interests: categoriesForInterests(interests) } : {}),
+        }),
+      })
+      if (!res.ok) {
+        setTripErr(true)
+        return
+      }
+      const body = (await res.json()) as {
+        kind: 'trip' | 'refusal'
+        trip?: ApiTrip
+      }
+      if (body.kind === 'trip' && body.trip) {
+        setTrips((prev) => [body.trip!, ...prev])
+        setTripText('')
+      } else {
+        // A refused trip request is a demand signal — show it as such.
+        setTripErr(true)
+      }
+    } catch {
+      setTripErr(true)
+    } finally {
+      setTripBusy(false)
+    }
+  }
+
+  const deleteTripCall = async (id: string) => {
+    if (deletingTrip || !window.confirm(lang === 'es' ? '¿Eliminar este viaje guardado? No se puede deshacer.' : 'Delete this saved trip? This cannot be undone.')) return
+    setDeletingTrip(id)
+    setTripDeleteError(false)
+    try {
+      const res = await fetch(`/api/trips/${id}`, { method: 'DELETE', credentials: 'include' })
+      if (!res.ok) throw new Error('Trip deletion failed')
+      setTrips((prev) => prev.filter((x) => x.id !== id))
+    } catch {
+      setTripDeleteError(true)
+    } finally {
+      setDeletingTrip(null)
+    }
+  }
+
+  const shareTripWa = (trip: ApiTrip) => {
+    const days = [...new Set(trip.stops.map((s) => s.dayIndex))].sort((a, b) => a - b)
+    const lines = days.map((d) => {
+      const stops = trip.stops
+        .filter((s) => s.dayIndex === d)
+        .sort((a, b) => a.startMin - b.startMin)
+        .map((s) => placeById(s.placeId)?.name)
+        .filter(Boolean)
+        .join(' → ')
+      return `${t.tripDay} ${d + 1}: ${stops}`
+    })
+    waShare(`${t.tripsTitle} — ${lines.join(' | ')} ${appUrl()}/t/${trip.shareSlug}`)
+  }
+
+  const ask = async () => {
+    const text = askText.trim()
+    if (!text || askState.kind === 'asking') return
+    setSelected(null)
+    setAskState({ kind: 'asking' })
+    try {
+      const body = await askApi(text)
+      if (!body) return setAskState({ kind: 'error' })
+      if (body.kind === 'chat' || body.kind === 'mission' || body.kind === 'notify') {
+        // A conversation turn belongs in the thread, not the map card.
+        setActiveTab('guaca')
+        setThread((prev) => {
+          const next = [...prev, { id: localId(), role: 'user' as const, text }, { id: localId(), role: 'guaca' as const, kind: body.kind, text: body.text }].slice(-60)
+          saveJson(THREAD_KEY, next)
+          return next
+        })
+        return setAskState({ kind: 'idle' })
+      }
+      bumpStats(body.kind === 'refusal')
+      if (body.kind === 'answer') {
+        setAskState({ kind: 'answer', text: body.text, placeIds: body.placeIds })
+        savePlanFromAnswer(text, body.text, body.placeIds)
+      } else {
+        setAskState({
+          kind: 'refusal',
+          text: body.text,
+          ...(body.questionId ? { questionId: body.questionId } : {}),
+          ...(body.refusal ? { refusal: body.refusal } : {}),
+        })
+      }
+    } catch {
+      setAskState({ kind: 'error' })
+    }
+  }
+
+  const askGuaca = async (raw?: string) => {
+    const text = (raw ?? guacaText).trim()
+    if (!text || guacaBusy) return
+    setGuacaText('')
+    setGuacaBusy(true)
+    const userMsg: ChatMsg = { id: localId(), role: 'user', text }
+    setThread((prev) => {
+      const next = [...prev, userMsg]
+      saveJson(THREAD_KEY, next)
+      return next
+    })
+    let reply: ChatMsg
+    try {
+      const body = await askApi(text, true)
+      if (!body) {
+        reply = { id: localId(), role: 'guaca', kind: 'error', text: t.askError }
+      } else {
+        if (body.kind === 'answer' || body.kind === 'refusal') bumpStats(body.kind === 'refusal')
+        reply = {
+          id: localId(),
+          role: 'guaca',
+          kind: body.kind,
+          text: body.text,
+          placeIds: body.placeIds,
+          ...(body.lead ? { lead: body.lead } : {}),
+          ...(body.questionId ? { questionId: body.questionId } : {}),
+          ...(body.suggestions ? { suggestions: body.suggestions } : {}),
+          ...(body.refusal ? { refusal: body.refusal } : {}),
+          ...(body.notes?.length ? { notes: body.notes } : {}),
+        }
+        if (body.context) setNow(body.context)
+        if (body.kind === 'answer') savePlanFromAnswer(text, body.text, body.placeIds)
+        if (body.kind === 'mission' && body.mission) {
+          const m = body.mission
+          setMissions((prev) => ({ ...prev, [m.questionId]: { status: m.status as MissionState['status'], ...(m.spotterName ? { spotterName: m.spotterName } : {}), ...(m.expiresAt ? { expiresAt: m.expiresAt } : {}) } }))
+          setNotified((prev) => new Set(prev).add(m.questionId))
+        }
+        if (body.kind === 'notify') {
+          const last = [...thread].reverse().find((m) => m.kind === 'refusal' && m.questionId)
+          if (last?.questionId) setNotified((prev) => new Set(prev).add(last.questionId!))
+        }
+      }
+    } catch {
+      reply = { id: localId(), role: 'guaca', kind: 'error', text: t.askError }
+    }
+    setThread((prev) => {
+      const next = [...prev, reply].slice(-60)
+      saveJson(THREAD_KEY, next)
+      return next
+    })
+    setGuacaBusy(false)
+  }
+
+  /**
+   * Guaca speaking first. Each undelivered message lands in the thread as
+   * its own bubble; a replan also replaces the saved plan. Polled every two
+   * minutes and whenever the app comes back to the front.
+   */
+  const takeInbox = useCallback(async () => {
+    try {
+      const r = await fetch('/api/tourist/inbox', { credentials: 'include' })
+      if (!r.ok) return
+      const d = (await r.json()) as { messages: Array<{ id: string; trigger: string; text: string; payload: { plan?: string; placeIds?: string[]; stops?: Array<{ placeId: string; name: string }> } | null; createdAt: string }> }
+      if (!d.messages?.length) return
+      const bubbles: ChatMsg[] = d.messages.map((m) => ({
+        id: `first:${m.id}`, role: 'guaca', kind: 'first', trigger: m.trigger,
+        text: m.payload?.plan ? `${m.text}\n\n${m.payload.plan}` : m.text,
+        ...(m.payload?.placeIds?.length ? { placeIds: m.payload.placeIds } : {}),
+        ...(m.payload?.stops?.length ? { checkin: m.payload.stops } : {}),
+      }))
+      setThread((prev) => {
+        const next = [...prev, ...bubbles].slice(-60)
+        saveJson(THREAD_KEY, next)
+        return next
+      })
+      const replan = d.messages.find((m) => m.trigger === 'rain_replan' && m.payload?.plan && m.payload.placeIds)
+      if (replan?.payload?.plan && replan.payload.placeIds) savePlanFromAnswer(plan?.question ?? '', replan.payload.plan, replan.payload.placeIds)
+      setUnreadFirst((n) => n + d.messages.length)
+    } catch {
+      // Silence is fine; the next poll tries again.
+    }
+  }, [plan?.question])
+  useEffect(() => {
+    // The view is behind login already; a 401 from the inbox is a quiet no-op.
+    void takeInbox()
+    const id = setInterval(() => void takeInbox(), 120_000)
+    const onFocus = () => void takeInbox()
+    window.addEventListener('focus', onFocus)
+    return () => { clearInterval(id); window.removeEventListener('focus', onFocus) }
+  }, [takeInbox])
+  useEffect(() => { if (activeTab === 'guaca') setUnreadFirst(0) }, [activeTab])
+
+  // Guaca says hello first: when the conversation opens empty, once a day.
+  const helloAsked = useRef(false)
+  useEffect(() => {
+    if (activeTab !== 'guaca' || thread.length > 0 || helloAsked.current) return
+    helloAsked.current = true
+    const [lon, lat] = center
+    fetch('/api/tourist/hello', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ lat, lon, language: lang }) })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { message: { id: string; trigger: string; text: string } | null } | null) => {
+        if (!d?.message) return
+        const m = d.message
+        setThread((prev) => {
+          if (prev.length > 0) return prev
+          const next: ChatMsg[] = [{ id: `first:${m.id}`, role: 'guaca', kind: 'first', trigger: 'welcome', text: m.text }]
+          saveJson(THREAD_KEY, next)
+          return next
+        })
+      })
+      .catch(() => {})
+  }, [activeTab, thread.length, center, lang])
+
+  const sendVerdicts = async (msgId: string, verdicts: Record<string, string>) => {
+    setThread((prev) => {
+      const next = prev.map((m) => (m.id === msgId ? { ...m, verdicts } : m))
+      saveJson(THREAD_KEY, next)
+      return next
+    })
+    await fetch('/api/tourist/feedback', {
+      method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ verdicts: Object.entries(verdicts).map(([placeId, verdict]) => ({ placeId, verdict })) }),
+    }).catch(() => {})
+  }
+
+  /** Everything under a refusal's headline: honest coverage, the chips, the watch, and the local as the last option. */
+  const renderRefusalBody = (questionId: string | undefined, ctx: RefusalContext | undefined, onAsk: (text: string) => void, compact: boolean, tone: 'dark' | 'light' = 'dark') => {
+    const light = tone === 'light'
+    const label = (c: string | null) => (c ? (t.categoryLabels[c] ?? c).toLowerCase() : '')
+    const fill = (s: string, vars: Record<string, string | number>) => Object.entries(vars).reduce((acc, [k, v]) => acc.replaceAll(`{${k}}`, String(v)), s)
+    const mission = questionId ? missions[questionId] : undefined
+    const chips = (ctx?.options ?? []).filter((o): o is Extract<RefusalOption, { kind: 'ask' | 'refine' }> => o.kind === 'ask' || o.kind === 'refine')
+    const hasNotify = (ctx?.options ?? []).some((o) => o.kind === 'notify')
+    const hasMission = (ctx?.options ?? []).some((o) => o.kind === 'mission')
+    const hours = mission?.expiresAt ? Math.max(1, Math.round((new Date(mission.expiresAt).getTime() - Date.now()) / 3_600_000)) : 48
+    const missionLine = !mission ? null
+      : mission.status === 'sending' ? t.refusalMissionSending
+      : mission.status === 'commissioned' ? fill(t.refusalMissionSent, { name: mission.spotterName ?? 'A local', hours })
+      : mission.status === 'already_open' ? fill(t.refusalMissionOpen, { name: mission.spotterName ?? 'a local', when: mission.expiresAt ? new Date(mission.expiresAt).toLocaleDateString() : '' })
+      : mission.status === 'budget' || mission.status === 'needs_approval' ? t.refusalMissionBudget
+      : mission.status === 'no_spotter' ? t.refusalMissionNoSpotter
+      : t.refusalMissionFailed
+    const txt = compact ? 'text-[10.5px]' : 'text-[11px]'
+    return (
+      <>
+        {ctx && !ctx.spoken && (
+          <p className={`mt-2 ${txt} font-bold leading-relaxed text-white/70`}>
+            {ctx.reason === 'UNCLEAR_QUESTION'
+              ? t.refusalUnclear
+              : ctx.coverage.inCategory > 0
+                ? fill(t.refusalCoverage, { n: ctx.coverage.verifiedNearby, c: ctx.coverage.inCategory, category: label(ctx.category) })
+                : fill(t.refusalCoverageNone, { n: ctx.coverage.verifiedNearby, category: label(ctx.category) })}
+          </p>
+        )}
+        {!ctx && <p className={`mt-2 ${txt} font-bold leading-relaxed text-white/65`}>{t.refusalNote}</p>}
+        {chips.length > 0 && (
+          <div className="mt-3">
+            {ctx?.reason !== 'UNCLEAR_QUESTION' && !ctx?.spoken && <p className={`${txt} font-black text-white/85`}>{t.refusalOffer}</p>}
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {chips.map((o) => (
+                <button key={o.label} type="button" onClick={() => onAsk(o.text)} className={light
+                  ? 'rounded-full bg-guaca-teal/8 px-3 py-1.5 text-[11px] font-black text-guaca-teal hover:bg-guaca-teal/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-guaca-teal/50'
+                  : 'rounded-full border border-white/25 bg-white/10 px-3 py-1.5 text-[11px] font-black text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70'}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {questionId && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {hasNotify && !mission && (notified.has(questionId) ? (
+              <p className={`flex items-center gap-1.5 text-[11px] font-black ${light ? 'text-guaca-teal-dark' : 'text-guaca-mango-light'}`}>
+                <Check className="h-3.5 w-3.5" /> {t.refusalNotifySaved}
+              </p>
+            ) : (
+              <button type="button" onClick={() => notifyMe(questionId)} className={light
+                ? 'flex items-center gap-1.5 rounded-full bg-guaca-teal/8 px-3 py-2 text-[11px] font-black text-guaca-teal hover:bg-guaca-teal/15'
+                : 'flex items-center gap-1.5 rounded-full bg-guaca-mango px-3 py-2 text-[11px] font-black text-guaca-ocean-deep hover:bg-guaca-mango-light'}>
+                <Bell className="h-3.5 w-3.5" /> {t.refusalNotify}
+              </button>
+            ))}
+            {hasMission && !mission && (
+              <button type="button" onClick={() => void requestMission(questionId)} className={light
+                ? 'flex items-center gap-1.5 rounded-full bg-guaca-coral/10 px-3 py-2 text-[11px] font-black text-guaca-coral-dark hover:bg-guaca-coral/20'
+                : 'flex items-center gap-1.5 rounded-full border border-guaca-coral/80 bg-guaca-coral/20 px-3 py-2 text-[11px] font-black text-white hover:bg-guaca-coral/35'}>
+                <Radio className="h-3.5 w-3.5 text-guaca-coral" /> {t.refusalMission}
+              </button>
+            )}
+          </div>
+        )}
+        {missionLine && (
+          <p className={`mt-3 flex items-start gap-1.5 ${txt} font-black leading-relaxed ${light ? 'text-guaca-teal-dark' : mission?.status === 'commissioned' || mission?.status === 'already_open' ? 'text-guaca-mango-light' : 'text-white/80'}`}>
+            {mission?.status === 'sending' ? <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin" /> : <Radio className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+            <span>{missionLine}</span>
+          </p>
+        )}
+      </>
+    )
+  }
+
+  /** Phone, website, socials and address from a public listing, labelled as
+   *  such until a local confirmed them. Links only; nothing is asserted. */
+  const renderPublicInfo = (p: { public_phone?: string | null; public_website?: string | null; public_socials?: string[] | null; public_address?: string | null; public_subcategory?: string | null; contact_confirmed_at?: string | null }) => {
+    if (!p.public_phone && !p.public_website && !(p.public_socials?.length) && !p.public_address && !p.public_subcategory) return null
+    const socialName = (u: string) => (/instagram/.test(u) ? 'Instagram' : /facebook/.test(u) ? 'Facebook' : /twitter|x\.com/.test(u) ? 'X' : /tiktok/.test(u) ? 'TikTok' : /wa\.me|whatsapp/.test(u) ? 'WhatsApp' : 'Link')
+    const tel = p.public_phone?.replace(/[^\d+]/g, '')
+    return (
+      <div className={`mt-3 rounded-2xl p-3 ${p.contact_confirmed_at ? 'bg-guaca-teal/7' : 'bg-guaca-ink/5'}`}>
+        <p className={`text-[9px] font-black uppercase tracking-[.1em] ${p.contact_confirmed_at ? 'text-guaca-teal' : 'text-guaca-ink/45'}`}>
+          {p.contact_confirmed_at ? t.contactConfirmed : t.publicListing}
+        </p>
+        {p.public_subcategory && <p className="mt-1 text-[11px] font-bold text-guaca-ink/75">{p.public_subcategory}</p>}
+        {p.public_address && <p className="mt-1 text-[11px] font-semibold text-guaca-ink/65">{p.public_address}</p>}
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {tel && <a href={`tel:${tel}`} className="rounded-full bg-white px-3 py-1.5 text-[11px] font-black text-guaca-ink ring-1 ring-guaca-sand hover:bg-guaca-sand-light">📞 {t.callCta} · {p.public_phone}</a>}
+          {p.public_website && <a href={p.public_website} target="_blank" rel="noopener noreferrer" className="rounded-full bg-white px-3 py-1.5 text-[11px] font-black text-guaca-ink ring-1 ring-guaca-sand hover:bg-guaca-sand-light">🌐 {t.websiteCta}</a>}
+          {(p.public_socials ?? []).slice(0, 3).map((u) => <a key={u} href={u} target="_blank" rel="noopener noreferrer" className="rounded-full bg-white px-3 py-1.5 text-[11px] font-black text-guaca-ink ring-1 ring-guaca-sand hover:bg-guaca-sand-light">{socialName(u)}</a>)}
+        </div>
+      </div>
+    )
+  }
+
+  const openPlace = (id: string) => {
+    const request = ++placeRequest.current
+    const candidate = candidates.find((p) => p.id === id)
+    const known = places.find((p) => p.id === id) ?? planPlaces[id] ?? (candidate ? { ...candidate, verification_status: 'candidate', landmark_description: null, description: null, spotter_name: null, spotter_photo_url: null, verified_at: null } : null)
+    if (known) setSelected(known)
+    fetch(`/api/places/${id}`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((full: ApiPlace | null) => {
+        // Merge over what we knew: the detail route has no review stats.
+        if (full && request === placeRequest.current) setSelected((prev) => (prev && prev.id === full.id ? { ...prev, ...full } : full))
+      })
+      .catch(() => {})
+  }
+
+  const openPlaceOnMap = (id: string) => {
+    setActiveTab('map')
+    openPlace(id)
+  }
+
+  const changeLanguage = (next: 'en' | 'es') => {
+    if (next === lang) return
+    setLang(next)
+    fetch('/api/tourist/me', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ language: next }),
+    }).catch(() => {})
+  }
+
+  /** Flag a post — two reports auto-hide it and the operator reviews. */
+  const reportPost = (postId: string) => {
+    if (reported.has(postId)) return
+    setReported((prev) => new Set(prev).add(postId))
+    fetch(`/api/posts/${postId}/report`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ reason: 'other' }),
+    }).catch(() => {})
+  }
+
+  const cancelWatch = (questionId: string) => {
+    setWatching((prev) => prev.filter((w) => w.questionId !== questionId))
+    fetch(`/api/questions/${questionId}/notify`, {
+      method: 'DELETE',
+      credentials: 'include',
+    }).catch(() => {})
+  }
+
+  const linkVilla = async () => {
+    const code = villaCode.trim()
+    if (!code) return
+    setVillaErr(false)
+    try {
+      const res = await fetch('/api/tourist/villa-code', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ code }),
+      })
+      if (!res.ok) return setVillaErr(true)
+      const body = (await res.json()) as { propertyName: string }
+      setMe((prev) => (prev ? { ...prev, propertyName: body.propertyName } : prev))
+      setVillaCode('')
+    } catch {
+      setVillaErr(true)
+    }
+  }
+
+  const signOut = async () => {
+    try {
+      await fetch('/api/tourist/logout', { method: 'POST', credentials: 'include' })
+    } catch {
+      /* the cookie clear is best-effort; reload lands on the gate either way */
+    }
+    window.location.href = '/'
+  }
+
+  const placeById = (id: string): ApiPlace | undefined => {
+    const known = places.find((p) => p.id === id) ?? planPlaces[id]
+    if (known) return known
+    const listed = candidates.find((p) => p.id === id)
+    return listed ? { ...listed, verification_status: 'candidate', landmark_description: null, description: null, spotter_name: null, spotter_photo_url: null, verified_at: null } : undefined
+  }
+
+  const timelineStops = (placeIds: string[], timed?: Array<{ placeId: string; startMin: number; durationMin: number }>): TimelineStop[] => {
+    let cursor = 9 * 60
+    return placeIds.map((id) => {
+      const place = placeById(id)
+      const timedStop = timed?.find((row) => row.placeId === id)
+      const durationMin = timedStop?.durationMin ?? 60
+      const startMin = timedStop?.startMin ?? cursor
+      cursor = startMin + durationMin + 15
+      const glyph = CATEGORY_GLYPH[place?.category ?? ''] ?? { emoji: '📍', color: '#0D8B8B' }
+      return {
+        placeId: id,
+        name: place?.name ?? (lang === 'es' ? 'Ver lugar' : 'View place'),
+        category: place?.category ?? 'culture_history',
+        thumbnail: place?.public_profile?.image?.url ?? null,
+        icon: glyph.emoji,
+        startMin,
+        durationMin,
+        lat: place?.lat ?? null,
+        lon: place?.lon ?? null,
+        gettingThere: place?.public_profile?.gettingThere?.[lang] ?? null,
+      }
+    })
+  }
+
+  const selectedStay = selected ? stays.find((stay) => stay.placeId === selected.id) ?? null : null
+  const activityPlaceNames = useMemo(() => {
+    const names: Record<string, string> = {}
+    for (const activity of activities) {
+      for (const id of activity.placeIds) {
+        const place = places.find((row) => row.id === id) ?? candidates.find((row) => row.id === id) ?? planPlaces[id]
+        if (place) names[id] = place.name
+      }
+    }
+    return names
+  }, [activities, places, candidates, planPlaces])
+
+  const answerPlaces =
+    askState.kind === 'answer'
+      ? (askState.placeIds.map(placeById).filter(Boolean) as ApiPlace[])
+      : []
+
+  /** The day around the map centre: weather, sea, sunset, holiday, rates. */
+  const [now, setNow] = useState<AreaNow | null>(null)
+  useEffect(() => {
+    const [lng, lat] = center
+    const ctrl = new AbortController()
+    fetch(`/api/context?lat=${lat.toFixed(3)}&lon=${lng.toFixed(3)}`, { credentials: 'include', signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { context: AreaNow | null } | null) => { if (d?.context) setNow(d.context) })
+      .catch(() => {})
+    return () => ctrl.abort()
+  }, [Math.round(center[0] * 20) / 20, Math.round(center[1] * 20) / 20])
+  const nowLine = useMemo(() => {
+    if (!now) return null
+    const fill = (str: string, vars: Record<string, string | number>) => Object.entries(vars).reduce((acc, [k, v]) => acc.replaceAll(`{${k}}`, String(v)), str)
+    const bits: string[] = []
+    if (now.weather) bits.push(`${Math.round(now.weather.tempC)}°C${now.weather.rainPct >= 40 ? ` · ☔ ${fill(t.nowRain, { pct: now.weather.rainPct })}` : ''}${now.weather.uv >= 8 ? ` · UV ${Math.round(now.weather.uv)}` : ''}`)
+    if (now.sea) bits.push(t.nowSea[now.sea.state])
+    if (now.sun) bits.push(fill(t.nowSunset, { time: now.sun.sunset }))
+    if (now.holiday) bits.push(fill(t.nowHoliday, { name: now.holiday.localName }))
+    return bits.join(' · ')
+  }, [now, t])
+  const ratesLine = now?.rates ? Object.entries({ official: now.rates.official, currency: now.rates.currency, parallel: now.rates.parallel ?? '' }).reduce((acc, [k, v]) => acc.replaceAll(`{${k}}`, String(v)), t.nowRates).replace(/ · \s*(paralelo|parallel)$/, '') : null
+  const discoveryPlaces = useMemo(() => {
+    const all = new Map<string, ApiPlace>(places.map((p) => [p.id, p]))
+    for (const p of candidates) {
+      if (!all.has(p.id)) all.set(p.id, {
+        ...p, verification_status: 'candidate', landmark_description: null,
+        description: null, spotter_name: null, spotter_photo_url: null, verified_at: null,
+      })
+    }
+    return [...all.values()].filter((p) => (!catFilter || p.category === catFilter) && (!trendOnly || p.trendBadge != null))
+  }, [places, candidates, catFilter, trendOnly])
+
+  const renderMap = () => (
+    <>
+      <div className="tourist-map absolute inset-0 z-0">
+        <GuacaMap
+          pins={pins}
+          dots={dots}
+          heat={heat}
+          countries={countryMarkers}
+          zones={zoneMarkers}
+          onZoneSelect={handleZoneSelect}
+          onCountrySelect={handleCountrySelect}
+          zoneOutlines={zoneOutlines}
+          flyTo={selectedArea ? { lat: (selectedArea.bbox[1]! + selectedArea.bbox[3]!) / 2, lng: (selectedArea.bbox[0]! + selectedArea.bbox[2]!) / 2, zoom: selectedArea.slug === 'puerto-cabello' ? 13.2 : zoomForSpan(selectedArea.bbox), nonce: flyNonce } : undefined}
+          selectedPinId={selected?.id ?? null}
+          onPinClick={(id) => { setSelectedCandidate(null); openPlace(id) }}
+          onDotClick={(id) => {
+            setSelectedCandidate(null)
+            openPlace(id)
+          }}
+          mapStyle="streets"
+          center={center}
+          zoom={13.4}
+          fallbackImage="/assets/landing-caribbean-phone.jpg"
+        />
+      </div>
+      {offline && (
+        <p role="alert" className="absolute inset-x-4 top-[104px] z-[700] rounded-2xl bg-guaca-coral px-4 py-2.5 text-center text-[11px] font-black text-white shadow-lg">
+          {t.offline}
+        </p>
+      )}
+      {favoriteError && <p role="alert" className="absolute inset-x-4 top-36 z-[750] rounded-xl bg-guaca-paper p-3 text-center text-sm text-guaca-coral-dark shadow-lg">{lang === 'es' ? 'No se guardó el cambio. Toca el corazón para intentar de nuevo.' : 'Your change wasn’t saved. Tap the heart to try again.'}</p>}
+
+      {!geoAsked && (
+        <div className="absolute inset-0 z-[900] flex items-end bg-guaca-ocean-deep/45 p-4">
+          <div className="guaca-card w-full rounded-[30px] p-5">
+            <p className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-[.1em] text-guaca-teal">
+              <MapPin className="h-4 w-4" /> {t.geoTitle}
+            </p>
+            <p className="mt-2 text-[12px] font-semibold leading-relaxed text-guaca-ink/70">{t.geoBody}</p>
+            <Button type="button" onClick={useMyLocation} className="mt-4 h-11 w-full rounded-xl bg-guaca-teal text-xs font-black text-white hover:bg-guaca-teal-dark">
+              {t.geoAllow}
+            </Button>
+            <button type="button" onClick={skipLocation} className="mt-2 w-full py-2 text-[11px] font-bold text-guaca-ink/45 underline-offset-2 hover:underline">
+              {t.geoSkip}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="map-search-tools absolute inset-x-0 top-0 z-[400] px-4 pb-6 pt-5 lg:inset-x-auto lg:left-0 lg:right-[360px] lg:px-6 lg:pb-0 lg:pt-6">
+        <form
+          onSubmit={(e) => { e.preventDefault(); void ask() }}
+          className="flex items-center gap-2 rounded-full border border-white/65 bg-guaca-sand-light/95 px-3 py-2 shadow-xl shadow-guaca-ocean-deep/14 backdrop-blur-md lg:max-w-[600px] lg:gap-3 lg:border-white lg:bg-white lg:px-5 lg:py-2.5 lg:shadow-[0_12px_40px_-12px_rgba(12,74,92,0.35)]"
+        >
+          <Sparkles aria-hidden="true" className="h-5 w-5 shrink-0 text-guaca-teal" />
+          <Input
+            value={askText}
+            onChange={(event) => setAskText(event.target.value)}
+            placeholder={t.askPlaceholder}
+            aria-label={t.askPlaceholder}
+            className="h-7 flex-1 border-0 bg-transparent px-0 text-[12px] shadow-none placeholder:text-guaca-ink/35 focus-visible:ring-0 lg:h-10 lg:text-[16px] lg:placeholder:text-guaca-ink/40"
+          />
+          <Button type="submit" size="icon" disabled={askState.kind === 'asking' || !askText.trim()} aria-label={lang === 'es' ? 'Enviar pregunta' : 'Send question'} className="h-11 w-11 shrink-0 rounded-full bg-guaca-teal text-white hover:bg-guaca-teal-dark">
+            {askState.kind === 'asking' ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
+          </Button>
+          <Button type="button" size="icon" variant="ghost" aria-label={t.profileUpdates} onClick={() => setActiveTab('updates')} className="relative h-11 w-11 shrink-0 rounded-full bg-guaca-sand-light text-guaca-ocean hover:bg-white">
+            <Bell aria-hidden="true" className="h-3.5 w-3.5 lg:h-5 lg:w-5" />
+            {updates.length > 0 && <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-guaca-coral ring-2 ring-white" />}
+          </Button>
+        </form>
+        {/* Category filter — browse without typing. */}
+        <div className="map-categories mt-2.5 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] lg:mt-3 lg:gap-2">
+          <button
+            type="button"
+            onClick={() => setCatFilter(null)}
+            aria-pressed={catFilter === null}
+            className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-black shadow-md backdrop-blur-md lg:px-4 lg:py-2.5 lg:text-[14px] lg:shadow-[0_8px_24px_-10px_rgba(12,74,92,0.35)] ${catFilter === null ? 'bg-guaca-ocean-deep text-white' : 'bg-guaca-sand-light/92 text-guaca-ink/70 lg:bg-white lg:text-guaca-ink'}`}
+          >
+            {t.allCategories}
+          </button>
+          {Object.keys(CATEGORY_GLYPH).map((key) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setCatFilter((prev) => (prev === key ? null : key))}
+              aria-pressed={catFilter === key}
+              className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-black shadow-md backdrop-blur-md lg:px-4 lg:py-2.5 lg:text-[14px] lg:shadow-[0_8px_24px_-10px_rgba(12,74,92,0.35)] ${catFilter === key ? 'bg-guaca-ocean-deep text-white' : 'bg-guaca-sand-light/92 text-guaca-ink/70 lg:bg-white lg:text-guaca-ink'}`}
+            >
+              {(() => { const Icon = PLACE_ICONS[key] ?? MapPin; return <Icon aria-hidden="true" className="mr-1.5 inline-block h-4 w-4" /> })()} {t.categoryLabels[key] ?? key}
+            </button>
+          ))}
+          <button
+            type="button"
+            aria-pressed={trendOnly}
+            onClick={() => setTrendOnly((prev) => !prev)}
+            className={`shrink-0 rounded-full px-3 py-1.5 text-[11px] font-black shadow-md backdrop-blur-md lg:px-4 lg:py-2.5 lg:text-[14px] lg:shadow-[0_8px_24px_-10px_rgba(12,74,92,0.35)] ${trendOnly ? 'bg-guaca-coral text-white' : 'bg-guaca-sand-light/92 text-guaca-ink/70 lg:bg-white lg:text-guaca-ink'}`}
+          >
+            <TrendingUp aria-hidden="true" className="mr-1.5 inline-block h-4 w-4" /> {t.trendChip}
+          </button>
+        </div>
+        {/* Location pill — the country→city picker entry point. */}
+        <button
+          type="button"
+          onClick={() => setPickerOpen(true)}
+          className="mt-1.5 flex items-center gap-1.5 rounded-full bg-guaca-ocean-deep/85 px-3 py-1.5 text-[11px] font-black text-white shadow-md backdrop-blur-md lg:mt-3 lg:gap-2 lg:bg-white lg:px-5 lg:py-3 lg:text-[16px] lg:text-guaca-ink lg:shadow-[0_8px_24px_-10px_rgba(12,74,92,0.35)]"
+        >
+          <MapPin className="h-3 w-3 text-guaca-mango-light lg:hidden" />
+          {selectedArea ? `${flagOf(selectedArea.country)} ${selectedArea.name}` : t.pickerExplore}
+          <ChevronDown className="h-3 w-3 lg:h-4 lg:w-4" />
+        </button>
+        {nowLine && (
+          <p className="mt-1.5 inline-flex items-center gap-1.5 rounded-full bg-guaca-ocean-deep/70 px-3 py-1 text-[10.5px] font-bold text-white/90 backdrop-blur-md lg:hidden">
+            <Sun className="h-3 w-3 text-guaca-mango-light" /> {nowLine}
+          </p>
+        )}
+      </div>
+
+      {/* Country → city picker — every label an honest claim. */}
+      {pickerOpen && (
+        <div className="absolute inset-0 z-[950] flex items-end bg-guaca-ocean-deep/55 p-4" onClick={() => setPickerOpen(false)}>
+          <div className="guaca-card max-h-[75%] w-full overflow-y-auto rounded-[30px] p-5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <p className="flex items-center gap-1.5 text-[11px] font-black uppercase tracking-[.1em] text-guaca-teal">
+                <Globe className="h-4 w-4" /> {t.pickerTitle}
+              </p>
+              {nearCountryCode && (
+                <button
+                  type="button"
+                  onClick={() => setShowAllCountries((v) => !v)}
+                  className="rounded-full bg-guaca-teal/10 px-3 py-1.5 text-[10px] font-black text-guaca-teal hover:bg-guaca-teal/20"
+                >
+                  {showAllCountries ? t.pickerNearMe : t.pickerShowAll}
+                </button>
+              )}
+              <button type="button" aria-label={t.close} onClick={() => setPickerOpen(false)} className="grid h-8 w-8 place-items-center rounded-full bg-guaca-ink/6 text-guaca-ink/60 hover:bg-guaca-ink/10">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <input
+              value={pickerQuery}
+              onChange={(e) => setPickerQuery(e.target.value)}
+              placeholder={t.pickerSearch}
+              aria-label={t.pickerSearch}
+              className="mt-2.5 h-10 w-full rounded-2xl border border-guaca-sand bg-white px-4 text-[13px] font-bold text-guaca-ink outline-none placeholder:text-guaca-ink/30 focus:border-guaca-teal/50"
+            />
+
+            {visiblePickerGroups.map((group) => (
+              <div key={group.status} className="mt-3">
+                <p className="px-1 text-[9px] font-black uppercase tracking-[.12em] text-guaca-ink/40">
+                  {group.status === 'live' ? `🟢 ${t.countryLive}` : group.status === 'planned' ? `🟠 ${t.countryPlanned}` : `⚪ ${t.countryUncovered}`}
+                </p>
+                <div className="mt-1.5 space-y-1">
+                  {group.countries.map(({ country, areas: countryAreas }) => {
+                    const isOpen = openCountry === country.code
+                    const hasAreas = countryAreas.length > 0
+                    return (
+                      <div key={country.code} className="rounded-2xl bg-guaca-sand-light/60">
+                        <button
+                          type="button"
+                          onClick={() => setOpenCountry(isOpen ? null : country.code)}
+                          className="flex w-full items-center justify-between px-3.5 py-2.5 text-left"
+                        >
+                          <span className="text-[12px] font-black text-guaca-ink">
+                            {flagOf(country.code)} {lang === 'es' ? country.nameEs : country.name}
+                          </span>
+                          <ChevronDown className={`h-3.5 w-3.5 text-guaca-ink/40 transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+                        </button>
+                        {isOpen && (
+                          <div className="px-2 pb-2">
+                            {hasAreas ? countryAreas.map((a) => (
+                              <button
+                                key={a.id}
+                                type="button"
+                                onClick={() => selectArea(a)}
+                                className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left hover:bg-guaca-teal/10 ${a.id === selectedAreaId ? 'bg-guaca-teal/12' : ''}`}
+                              >
+                                <span className="text-[12px] font-bold text-guaca-ink">
+                                  {a.id === selectedAreaId ? '📍 ' : ''}{a.name}
+                                </span>
+                                <span className="shrink-0 text-[9px] font-bold text-guaca-ink/45">
+                                  {a.verifiedCount > 0 && <span className="text-guaca-teal">{a.verifiedCount} {t.pickerVerified}</span>}
+                                  {a.verifiedCount > 0 && a.candidateCount > 0 && ' · '}
+                                  {a.candidateCount > 0 && <span>{a.candidateCount} {t.pickerCandidates}</span>}
+                                </span>
+                              </button>
+                            )) : (
+                              <p className="px-3 py-2 text-[10px] font-semibold leading-relaxed text-guaca-ink/40">{t.pickerNoAreas}</p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Zone demand, scoped to the selected area — the honest "N people
+          asked here" that funds missions, about where you are looking. */}
+      {!selected && !selectedCandidate && (selectedArea?.peopleAsking ?? 0) > 0 && (
+        <div className="absolute bottom-24 left-4 z-[600] w-[200px] rounded-[22px] bg-guaca-ocean-deep/92 p-3.5 text-white shadow-lg backdrop-blur-md lg:bottom-8 lg:left-6 lg:flex lg:w-[330px] lg:items-center lg:gap-4 lg:rounded-[26px] lg:p-5">
+          <span className="hidden h-12 w-12 shrink-0 place-items-center rounded-full bg-guaca-teal/25 lg:grid">
+            <UsersRound className="h-6 w-6 text-guaca-teal" />
+          </span>
+          <div className="min-w-0 flex-1">
+          <p className="text-[8.5px] font-black uppercase tracking-[.12em] text-white/60 lg:text-[11px] lg:text-white/85">
+            <UsersRound className="mr-1 inline h-3 w-3 lg:hidden" /> {t.zoneDemandTitle}
+          </p>
+          <p className="mt-1 text-[13px] font-black leading-tight lg:text-[15px]">
+            {selectedArea!.peopleAsking}{' '}
+            <span className="text-[10px] font-bold text-guaca-mango-light lg:text-[13px] lg:text-white/85">
+              {selectedArea!.peopleAsking === 1 ? t.personAsking : t.peopleAsking} · {selectedArea!.name}
+            </span>
+          </p>
+          {zoneDemandList.length > 0 && (
+            <div className="mt-1.5 space-y-0.5 border-t border-white/15 pt-1.5">
+              {zoneDemandList.map((z) => (
+                <div key={z.zoneId} className="flex items-baseline justify-between gap-2">
+                  <span className="min-w-0 flex-1 truncate text-[10px] font-bold">{z.zoneName}</span>
+                  <span className="shrink-0 text-[10px] font-black tabular-nums text-guaca-mango-light">
+                    {z.peopleCount}👤
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          </div>
+          <ChevronRight className="hidden h-5 w-5 shrink-0 text-white/70 lg:block" />
+        </div>
+      )}
+
+      <PlaceDiscovery
+        places={discoveryPlaces}
+        areaName={selectedArea?.name ?? 'Puerto Cabello'}
+        center={center}
+        categories={t.categoryLabels}
+        loading={placesLoading}
+        error={offline}
+        onRetry={() => setPlacesRetry((n) => n + 1)}
+        onSelect={(id) => { setSelectedCandidate(null); openPlace(id) }}
+        savedIds={favIds}
+        onSave={(p) => { const full = discoveryPlaces.find((place) => place.id === p.id); if (full) toggleFavorite(full) }}
+        context={[nowLine, ratesLine].filter(Boolean).join(' · ') || null}
+        hiddenOnMobile={Boolean(selected || selectedCandidate || reserveStay || askState.kind !== 'idle')}
+        mode={discoverMode}
+        onModeChange={(mode) => {
+          setDiscoverMode(mode)
+          if (mode === 'stays') setCatFilter('lodging')
+        }}
+        activitiesPanel={
+          <ActivitiesRail
+            activities={activities}
+            status={actStatus}
+            onRetry={() => setActRetry((n) => n + 1)}
+            interests={interests}
+            placeNames={activityPlaceNames}
+            onOpenPlace={(id) => { setSelectedCandidate(null); openPlace(id) }}
+            onAddPlaces={addPlacesToPlan}
+          />
+        }
+        staysPanel={
+          <StayDiscovery
+            stays={stays}
+            status={stayStatus}
+            onRetry={() => setStayRetry((n) => n + 1)}
+            onOpenPlace={(id) => { setSelectedCandidate(null); openPlace(id) }}
+            onReserve={(stay) => setReserveStay(stay)}
+          />
+        }
+      />
+
+      {/* Place sheet — landmark first, the Spotter's face on the record. */}
+      {selected && (
+        <div className="place-detail-position absolute bottom-4 left-4 right-4 z-[650] lg:bottom-6 lg:left-auto lg:right-[352px] lg:w-[440px]">
+          <div className="guaca-card place-detail-sheet rounded-2xl p-5">
+            <div className="place-detail-heading flex items-start justify-between gap-3">
+              <h2 className="text-2xl font-bold leading-tight tracking-tight text-guaca-ink">{selected.name}</h2>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-label={favIds.has(selected.id) ? t.favSaved : t.favSave}
+                  aria-pressed={favIds.has(selected.id)}
+                  onClick={() => toggleFavorite(selected)}
+                  className={`grid h-8 w-8 place-items-center rounded-full ${favIds.has(selected.id) ? 'bg-guaca-coral/12 text-guaca-coral' : 'bg-guaca-ink/6 text-guaca-ink/60 hover:bg-guaca-ink/10'}`}
+                >
+                  <Heart className={`h-4 w-4 ${favIds.has(selected.id) ? 'fill-guaca-coral' : ''}`} />
+                </button>
+                <button type="button" aria-label={t.close} onClick={() => { placeRequest.current++; setSelected(null) }} className="grid h-8 w-8 place-items-center rounded-full bg-guaca-ink/6 text-guaca-ink/60 hover:bg-guaca-ink/10">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            {(selected.ratingCount ?? 0) > 0 && selected.avgRating != null && (
+              <p className="mt-1 flex items-center gap-1 text-[12px] font-black text-guaca-mango-dark">
+                <Star className="h-3.5 w-3.5 fill-guaca-mango text-guaca-mango" />
+                {selected.avgRating.toFixed(1)}
+                <span className="font-bold text-guaca-ink/40">({selected.ratingCount})</span>
+              </p>
+            )}
+            {selected.trendBadge && (
+              <p className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-guaca-mango/15 px-2.5 py-1 text-[10px] font-black text-guaca-ocean-deep">
+                <TrendingUp className="h-3 w-3" />
+                {selected.trendBadge === 'trending' ? t.whyTrending : selected.trendBadge === 'asked_about' ? t.whyAskedAbout : t.whyFresh}
+              </p>
+            )}
+            {selected.landmark_description && (
+              <>
+                <p className="mt-3 text-[10px] font-black uppercase tracking-[.1em] text-guaca-teal">{t.landmarkLabel}</p>
+                <p className="mt-1 text-[15px] font-bold leading-snug text-guaca-ink">{selected.landmark_description}</p>
+              </>
+            )}
+            {selected.description && !selected.public_profile && (
+              <p className="mt-2 text-[11px] font-medium leading-relaxed text-guaca-ink/60">{selected.description}</p>
+            )}
+            {selected.public_profile && <PublicPlaceProfile profile={selected.public_profile} name={selected.name} />}
+            {renderPublicInfo(selected)}
+            <PlaceObservations placeId={selected.id} />
+            {selectedStay?.visibility === 'promoted' && (
+              <p className="mt-3 inline-flex rounded-full bg-guaca-mango/20 px-3 py-2 text-[11px] font-black text-guaca-ocean-deep">{t.stayPromoted}</p>
+            )}
+            {selectedStay?.merchantId ? (
+              <Button type="button" onClick={() => setReserveStay(selectedStay)} className="mt-3 h-11 w-full rounded-xl bg-guaca-teal text-[12px] font-black text-white hover:bg-guaca-teal-dark">
+                {t.stayReserve}
+              </Button>
+            ) : selected?.category === 'lodging' && selectedStay ? (
+              <p className="mt-3 text-[11px] font-semibold text-guaca-ink/55">{t.stayNotBookable}</p>
+            ) : null}
+            {selected.verification_status === 'candidate' ? (
+              <div className="mt-4 rounded-2xl bg-guaca-ink/5 p-3">
+                <p className="flex items-center gap-1 text-[10px] font-black uppercase tracking-[.1em] text-guaca-ink/55">
+                  <Globe className="h-3.5 w-3.5" /> {t.candidateTitle}
+                </p>
+                <p className="mt-1 text-[12px] font-bold text-guaca-ink/70">
+                  {(selected.corroboration ?? 0) >= 2 ? t.tierCorroborated.replaceAll('{n}', String(selected.corroboration)) : t.tierListed}
+                </p>
+              </div>
+            ) : (
+            <div className="mt-4 flex items-center gap-3 rounded-2xl bg-guaca-teal/7 p-3">
+              <Avatar url={selected.spotter_photo_url} name={selected.spotter_name} className="h-10 w-10" textClassName="text-xs" />
+              <div className="min-w-0">
+                <p className="flex items-center gap-1 text-[10px] font-black text-guaca-teal">
+                  <BadgeCheck className="h-3.5 w-3.5" /> {t.verifiedBy}
+                </p>
+                <p className="truncate text-[13px] font-black text-guaca-ink">
+                  {selected.spotter_name ?? '—'}
+                  {selected.verified_at && (
+                    <span className="ml-2 text-[10px] font-bold text-guaca-ink/45">
+                      {new Intl.DateTimeFormat(lang, { dateStyle: 'medium' }).format(new Date(selected.verified_at))}
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            )}
+
+            {/* Actions: navigate, ask, share, doubt — tourists can only
+                ask and doubt; nothing here publishes content. */}
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <Button type="button" onClick={() => directionsTo(selected)} className="h-10 rounded-xl bg-guaca-teal text-[11px] font-black text-white hover:bg-guaca-teal-dark">
+                <Navigation className="mr-1.5 h-3.5 w-3.5" /> {t.sheetDirections}
+              </Button>
+              <Button type="button" variant="ghost" onClick={() => askAboutPlace(selected)} className="h-10 rounded-xl bg-guaca-teal/8 text-[11px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                <Sparkles className="mr-1.5 h-3.5 w-3.5" /> {t.sheetAsk}
+              </Button>
+              <Button type="button" variant="ghost" onClick={() => sharePlace(selected)} className="h-10 rounded-xl bg-guaca-ocean/8 text-[11px] font-black text-guaca-ocean hover:bg-guaca-ocean/15">
+                <Share2 className="mr-1.5 h-3.5 w-3.5" /> {t.sheetShare}
+              </Button>
+              {doubted.has(selected.id) ? (
+                <span className="flex h-10 items-center justify-center gap-1.5 rounded-xl bg-guaca-mango/15 px-2 text-[10px] font-black text-guaca-mango-dark">
+                  <Check className="h-3.5 w-3.5" /> {t.sheetDoubtSent}
+                </span>
+              ) : (
+                <Button type="button" variant="ghost" onClick={() => doubtPlace(selected)} className="h-10 rounded-xl bg-guaca-ink/5 text-[11px] font-black text-guaca-ink/60 hover:bg-guaca-ink/10">
+                  <RefreshCcw className="mr-1.5 h-3.5 w-3.5" /> {t.sheetDoubt}
+                </Button>
+              )}
+            </div>
+
+            {/* "What locals say" — commentary + social videos, spotters first. */}
+            <button
+              type="button"
+              onClick={() => setPostsOpen((v) => !v)}
+              aria-expanded={postsOpen}
+              className="mt-3 flex w-full items-center justify-between rounded-xl bg-guaca-ink/4 px-3.5 py-2.5 text-[11px] font-black text-guaca-ink/70 hover:bg-guaca-ink/8"
+            >
+              <span className="flex items-center gap-1.5">
+                <MessageCircle className="h-3.5 w-3.5 text-guaca-teal" /> {t.postsTitle}
+                {posts.length > 0 && <span className="rounded-full bg-guaca-teal/10 px-1.5 py-0.5 text-[9px] text-guaca-teal">{posts.length}</span>}
+              </span>
+              <ArrowRight className={`h-3.5 w-3.5 transition-transform ${postsOpen ? 'rotate-90' : ''}`} />
+            </button>
+
+            {postsOpen && (
+              <div className="mt-2">
+                <div className="max-h-44 space-y-2 overflow-y-auto">
+                  {posts.length === 0 && (
+                    <p className="px-1 py-2 text-[11px] font-semibold text-guaca-ink/45">{t.postsEmpty}</p>
+                  )}
+                  {posts.map((p) => (
+                    <div key={p.id} className="rounded-2xl bg-guaca-ink/4 p-3">
+                      <div className="flex items-center gap-2">
+                        <Avatar
+                          url={p.author.photoUrl}
+                          name={p.author.name ?? t.postsTraveler}
+                          className="h-6 w-6"
+                          textClassName="text-[9px]"
+                          fallbackClassName={p.author.kind === 'spotter' ? 'bg-guaca-teal text-white' : 'bg-guaca-ink/30 text-white'}
+                        />
+                        <span className="truncate text-[11px] font-black text-guaca-ink">
+                          {p.author.name ?? t.postsTraveler}
+                        </span>
+                        {p.author.kind === 'spotter' && (
+                          <span className="flex items-center gap-0.5 rounded-full bg-guaca-teal/10 px-1.5 py-0.5 text-[8px] font-black text-guaca-teal">
+                            <BadgeCheck className="h-2.5 w-2.5" /> Spotter · Lv{p.author.level}
+                          </span>
+                        )}
+                        {p.visited && (
+                          <span className="flex items-center gap-0.5 rounded-full bg-guaca-mango/15 px-1.5 py-0.5 text-[8px] font-black text-guaca-mango-dark">
+                            <MapPin className="h-2.5 w-2.5" /> {t.postsVisited}
+                          </span>
+                        )}
+                        {p.rating != null && (
+                          <span className="ml-auto flex items-center gap-0.5 text-[9px] font-black text-guaca-mango-dark">
+                            <Star className="h-3 w-3 fill-guaca-mango text-guaca-mango" /> {p.rating}
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-1.5 text-[11px] font-semibold leading-relaxed text-guaca-ink/75">{p.body}</p>
+                      <div className="mt-1.5 flex items-center gap-2">
+                        {p.mediaUrl && (
+                          <a href={p.mediaUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 rounded-full bg-guaca-ocean-deep px-3 py-1.5 text-[9px] font-black text-white hover:bg-guaca-ocean">
+                            ▶ {t.postsWatch} · {mediaPlatform(p.mediaUrl)}
+                          </a>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => reportPost(p.id)}
+                          disabled={reported.has(p.id)}
+                          className="ml-auto flex items-center gap-1 text-[9px] font-black text-guaca-ink/35 hover:text-guaca-coral-dark disabled:text-guaca-ink/25"
+                        >
+                          <Flag className="h-3 w-3" /> {reported.has(p.id) ? t.postsReported : t.postsReport}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-2 space-y-1.5 rounded-2xl bg-white p-2.5 ring-1 ring-guaca-sand">
+                  <Input
+                    value={postText}
+                    onChange={(e) => setPostText(e.target.value)}
+                    placeholder={t.postsPlaceholder}
+                    maxLength={500}
+                    className="h-9 rounded-xl border-guaca-sand text-[12px]"
+                  />
+                  <Input
+                    value={postLink}
+                    onChange={(e) => setPostLink(e.target.value)}
+                    placeholder={t.postsLinkPlaceholder}
+                    className="h-9 rounded-xl border-guaca-sand text-[11px]"
+                  />
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-0.5" title={t.postsRatingHint}>
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <button key={n} type="button" aria-label={`${n}★`} onClick={() => setPostRating((r) => (r === n ? 0 : n))}>
+                          <Star className={`h-4 w-4 ${n <= postRating ? 'fill-guaca-mango text-guaca-mango' : 'text-guaca-ink/25'}`} />
+                        </button>
+                      ))}
+                    </div>
+                    <Button type="button" onClick={() => void submitPost()} disabled={postBusy || postText.trim().length === 0} className="h-8 rounded-xl bg-guaca-teal px-4 text-[11px] font-black text-white hover:bg-guaca-teal-dark">
+                      {t.postsSend}
+                    </Button>
+                  </div>
+                  <p className="text-[9px] font-semibold text-guaca-ink/40">{postErr ? t.postsError : t.postsRatingHint}</p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {reserveStay && (
+        <div className="place-detail-position absolute bottom-4 left-4 right-4 z-[660] lg:bottom-6 lg:left-auto lg:right-[352px] lg:w-[440px]">
+          <div className="guaca-card place-detail-sheet rounded-2xl p-5">
+            <ReserveStay
+              stay={reserveStay}
+              onClose={() => setReserveStay(null)}
+              onBooked={(reservation) => {
+                setReservations((prev) => {
+                  const rest = prev.filter((row) => row.id !== reservation.id)
+                  return [reservation, ...rest]
+                })
+                setBookStatus('ready')
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Candidate card — an OSM dot: known to open data, unknown to us. */}
+      {!selected && selectedCandidate && (
+        <div className="absolute bottom-4 left-4 right-4 z-[650] lg:bottom-6 lg:left-auto lg:right-[352px] lg:w-[440px]">
+          <div className="guaca-card rounded-[30px] p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="truncate text-lg font-black leading-tight text-guaca-ink">
+                  {(CATEGORY_GLYPH[selectedCandidate.category] ?? { emoji: '📍' }).emoji} {selectedCandidate.name}
+                </h3>
+                <p className="mt-1 inline-flex items-center gap-1 rounded-full bg-guaca-ink/6 px-2 py-0.5 text-[9px] font-black uppercase tracking-[.1em] text-guaca-ink/55">
+                  {t.candidateTitle}
+                </p>
+              </div>
+              <button type="button" aria-label={t.close} onClick={() => setSelectedCandidate(null)} className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-guaca-ink/6 text-guaca-ink/60 hover:bg-guaca-ink/10">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-2 text-[11px] font-semibold leading-relaxed text-guaca-ink/60">{t.candidateBody}</p>
+            {renderPublicInfo(selectedCandidate)}
+            <PlaceObservations placeId={selectedCandidate.id} />
+            <Button
+              type="button"
+              onClick={() => {
+                setGuacaText(t.candidateAsk.replace('{name}', selectedCandidate.name))
+                setSelectedCandidate(null)
+                setActiveTab('guaca')
+              }}
+              className="mt-3 h-10 w-full rounded-xl bg-guaca-teal text-[11px] font-black text-white hover:bg-guaca-teal-dark"
+            >
+              <Sparkles className="mr-1.5 h-3.5 w-3.5" /> {t.candidateCta}
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Ask result / teaser card. */}
+      {!selected && !selectedCandidate && (
+        <div className="absolute bottom-4 left-4 right-4 z-[650] lg:bottom-6 lg:left-auto lg:right-[352px] lg:w-[440px]">
+          {askState.kind === 'asking' && (
+            <div className="guaca-card rounded-[30px] p-4">
+              <p className="text-[12px] font-black text-guaca-ink/55">{t.asking}</p>
+            </div>
+          )}
+
+          {askState.kind === 'refusal' && (
+            <div className="rounded-[30px] bg-guaca-ocean-deep p-5 text-white shadow-xl">
+              <div className="flex items-start justify-between gap-3">
+                <p className="text-[10px] font-black uppercase tracking-[.12em] text-guaca-mango-light">{t.refusalTitle}</p>
+                <button type="button" aria-label={t.close} onClick={() => setAskState({ kind: 'idle' })} className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-white/10 text-white/70 hover:bg-white/20">
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <p className="mt-2 text-[15px] font-black leading-snug">{askState.text}</p>
+              {renderRefusalBody(askState.questionId, askState.refusal, (text) => { setAskState({ kind: 'idle' }); setActiveTab('guaca'); void askGuaca(text) }, false)}
+            </div>
+          )}
+
+          {askState.kind === 'answer' && (
+            <div className="guaca-card rounded-[30px] p-5">
+              <div className="flex items-start justify-between gap-3">
+                <p className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-[.12em] text-guaca-teal">
+                  <BadgeCheck className="h-3.5 w-3.5" /> {t.answerTitle}
+                </p>
+                <button type="button" aria-label={t.close} onClick={() => setAskState({ kind: 'idle' })} className="grid h-7 w-7 shrink-0 place-items-center rounded-full bg-guaca-ink/6 text-guaca-ink/60 hover:bg-guaca-ink/10">
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+              <p className="mt-2 whitespace-pre-line text-[13px] font-bold leading-relaxed text-guaca-ink">{askState.text}</p>
+              {answerPlaces.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {answerPlaces.map((p) => (
+                    <button key={p.id} type="button" onClick={() => openPlace(p.id)} className="rounded-full bg-guaca-teal/8 px-3 py-1.5 text-[10px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                      {(CATEGORY_GLYPH[p.category] ?? { emoji: '📍' }).emoji} {p.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {askState.kind === 'error' && (
+            <div className="guaca-card rounded-[30px] p-4">
+              <p className="text-[12px] font-black text-guaca-coral-dark">{t.askError}</p>
+            </div>
+          )}
+
+        </div>
+      )}
+    </>
+  )
+
+  const renderGuaca = () => (
+    <div className="guaca-conversation flex h-full flex-col bg-guaca-sand-light lg:px-[max(1.25rem,calc((100%-44rem)/2))]">
+      <div className="guaca-conversation-heading shrink-0 bg-gradient-to-br from-guaca-teal to-guaca-ocean px-5 pb-4 pt-12 text-white lg:mt-12 lg:rounded-[32px] lg:p-6 lg:shadow-xl">
+        <p className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-[.14em] text-white/80">
+          <Sparkles className="h-3.5 w-3.5" /> {t.guacaTitle}
+        </p>
+        <p className="mt-1 text-[12px] font-semibold leading-relaxed text-white/88">{t.guacaLede}</p>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4 pt-4">
+        {thread.length === 0 && (
+          <div className={thread.length === 0 ? 'rounded-[28px] border border-dashed border-guaca-teal/28 bg-white/70 p-5 text-center' : 'order-last mt-1 px-1'}>
+            {thread.length === 0 && (<>
+              <Sparkles aria-hidden="true" className="mx-auto h-7 w-7 text-guaca-teal/60" />
+              <h3 className="mt-3 text-[14px] font-black text-guaca-ink">{t.guacaEmptyTitle}</h3>
+              <p className="mx-auto mt-1 max-w-[250px] text-[11px] font-semibold leading-relaxed text-guaca-ink/50">{t.guacaEmptyBody}</p>
+            </>)}
+            <div className={thread.length === 0 ? 'mt-4 space-y-2' : 'flex flex-wrap gap-1.5'}>
+              {t.guacaSuggestions.map((s) => (
+                <button key={s} type="button" onClick={() => void askGuaca(s)} className="block w-full rounded-2xl bg-guaca-teal/8 px-4 py-2.5 text-[12px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                  {s}
+                </button>
+              ))}
+            </div>
+            {recs.length > 0 && (
+              <div className="mt-4 border-t border-guaca-sand pt-3 text-left">
+                <p className="flex items-center gap-1 text-[9px] font-black uppercase tracking-[.12em] text-guaca-ink/40">
+                  <TrendingUp className="h-3 w-3" /> {t.suggestionsTitle}
+                </p>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {recs.map((r) => (
+                    <button
+                      key={r.placeId}
+                      type="button"
+                      title={r.why === 'trending' ? t.whyTrending : r.why === 'asked_about' ? t.whyAskedAbout : t.whyFresh}
+                      onClick={() => openPlaceOnMap(r.placeId)}
+                      className="rounded-full bg-guaca-mango/15 px-3 py-1.5 text-[10px] font-black text-guaca-ocean-deep hover:bg-guaca-mango/30"
+                    >
+                      {r.why === 'trending' ? '🔥' : r.why === 'asked_about' ? '❓' : '✨'} {r.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {thread.map((m) =>
+            m.role === 'user' ? (
+              <div key={m.id} className="flex justify-end">
+                <p className="max-w-[80%] rounded-3xl rounded-br-lg bg-guaca-teal px-4 py-2.5 text-[13px] font-bold leading-relaxed text-white shadow-sm">{m.text}</p>
+              </div>
+            ) : m.kind === 'chat' || m.kind === 'mission' || m.kind === 'notify' ? (
+              <div key={m.id} className="guaca-card max-w-[92%] rounded-3xl rounded-bl-lg p-4">
+                <p className="flex items-center gap-1 text-[9px] font-black uppercase tracking-[.12em] text-guaca-teal"><Sparkles className="h-3 w-3" /> Guaca</p>
+                <p className="mt-1.5 whitespace-pre-line text-[13px] font-bold leading-relaxed text-guaca-ink">{m.text}</p>
+                {m.kind === 'mission' && (() => {
+                  const last = [...thread].reverse().find((x) => x.kind === 'refusal' && x.questionId)
+                  const st = last?.questionId ? missions[last.questionId] : undefined
+                  if (!st) return null
+                  const hours = st.expiresAt ? Math.max(1, Math.round((new Date(st.expiresAt).getTime() - Date.now()) / 3_600_000)) : 48
+                  const line = st.status === 'commissioned' ? t.refusalMissionSent.replaceAll('{name}', st.spotterName ?? 'A local').replaceAll('{hours}', String(hours))
+                    : st.status === 'already_open' ? t.refusalMissionOpen.replaceAll('{name}', st.spotterName ?? 'a local').replaceAll('{when}', st.expiresAt ? new Date(st.expiresAt).toLocaleDateString() : '')
+                    : st.status === 'budget' || st.status === 'needs_approval' ? t.refusalMissionBudget
+                    : st.status === 'no_spotter' ? t.refusalMissionNoSpotter : t.refusalMissionFailed
+                  return <p className="mt-2 flex items-start gap-1.5 text-[11px] font-black leading-relaxed text-guaca-teal-dark"><Radio className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>{line}</span></p>
+                })()}
+                {m.kind === 'notify' && <p className="mt-2 flex items-center gap-1.5 text-[11px] font-black text-guaca-teal-dark"><Check className="h-3.5 w-3.5" /> {t.refusalNotifySaved}</p>}
+              </div>
+            ) : m.kind === 'first' ? (
+              <div key={m.id} className="max-w-[92%] rounded-3xl rounded-bl-lg border border-guaca-teal/25 bg-guaca-teal/6 p-4">
+                <p className="flex items-center gap-1.5 text-[9px] font-black uppercase tracking-[.12em] text-guaca-teal">
+                  <Sparkles className="h-3 w-3" /> {t.firstEyebrow[m.trigger ?? ''] ?? 'Guaca'}
+                </p>
+                <p className="mt-1.5 whitespace-pre-line text-[13px] font-bold leading-relaxed text-guaca-ink">{m.text}</p>
+                {m.checkin && (
+                  <div className="mt-3 space-y-2">
+                    {m.checkin.map((s) => {
+                      const v = m.verdicts?.[s.placeId]
+                      const opt = (verdict: string, label: string) => (
+                        <button key={verdict} type="button" disabled={!!v} onClick={() => void sendVerdicts(m.id, { ...(m.verdicts ?? {}), [s.placeId]: verdict })}
+                          className={`rounded-full px-2.5 py-1 text-[10px] font-black ${v === verdict ? 'bg-guaca-teal text-white' : v ? 'bg-guaca-ink/5 text-guaca-ink/35' : 'bg-white text-guaca-teal ring-1 ring-guaca-teal/30 hover:bg-guaca-teal/10'}`}>
+                          {label}
+                        </button>
+                      )
+                      return (
+                        <div key={s.placeId} className="flex flex-wrap items-center gap-1.5">
+                          <span className="mr-1 text-[12px] font-black text-guaca-ink">{s.name}</span>
+                          {opt('good', t.checkinGood)}{opt('not_there', t.checkinNotThere)}{opt('skipped', t.checkinSkipped)}
+                        </div>
+                      )
+                    })}
+                    {m.verdicts && Object.keys(m.verdicts).length === m.checkin.length && (
+                      <p className="text-[11px] font-bold text-guaca-ink/55">{t.checkinThanks}</p>
+                    )}
+                  </div>
+                )}
+                {(m.placeIds ?? []).length > 0 && (
+                  <div className="mt-2.5 flex flex-wrap gap-1.5">
+                    {(m.placeIds ?? []).map((id) => { const p = placeById(id); return p ? (
+                      <button key={id} type="button" onClick={() => openPlaceOnMap(id)} className="rounded-full bg-guaca-teal/8 px-3 py-1.5 text-[10px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                        {(CATEGORY_GLYPH[p.category] ?? { emoji: '📍' }).emoji} {p.name}
+                      </button>) : null })}
+                  </div>
+                )}
+              </div>
+            ) : m.kind === 'refusal' && m.refusal?.spoken ? (
+              <div key={m.id} className="guaca-card max-w-[92%] rounded-3xl rounded-bl-lg p-4">
+                {m.notes?.map((n) => <p key={n} className="mb-1.5 flex items-start gap-1.5 text-[11px] font-bold leading-snug text-guaca-mango-dark"><Sun className="mt-0.5 h-3.5 w-3.5 shrink-0" />{n}</p>)}
+                <p className="whitespace-pre-line text-[13px] font-bold leading-relaxed text-guaca-ink">{m.text}</p>
+                {renderRefusalBody(m.questionId, m.refusal, (text) => void askGuaca(text), true, 'light')}
+              </div>
+            ) : m.kind === 'refusal' ? (
+              <div key={m.id} className="max-w-[92%] rounded-3xl rounded-bl-lg bg-guaca-ocean-deep p-4 text-white shadow-md">
+                {m.lead && <p className="mb-2 text-[12px] font-bold leading-relaxed text-white/85">{m.lead}</p>}
+                {m.notes?.map((n) => <p key={n} className="mb-1.5 flex items-start gap-1.5 text-[11px] font-bold leading-snug text-guaca-mango-light"><Sun className="mt-0.5 h-3.5 w-3.5 shrink-0" />{n}</p>)}
+                <p className="text-[9px] font-black uppercase tracking-[.12em] text-guaca-mango-light">{t.refusalTitle}</p>
+                <p className="mt-1.5 whitespace-pre-line text-[13px] font-black leading-snug">{m.text}</p>
+                {renderRefusalBody(m.questionId, m.refusal, (text) => void askGuaca(text), true)}
+              </div>
+            ) : (
+              <div key={m.id} className="guaca-card max-w-[92%] rounded-3xl rounded-bl-lg p-4">
+                {m.lead && <p className="mb-2 text-[12px] font-bold leading-relaxed text-guaca-ink/75">{m.lead}</p>}
+                {m.notes?.map((n) => <p key={n} className="mb-1.5 flex items-start gap-1.5 text-[11px] font-bold leading-snug text-guaca-mango-dark"><Sun className="mt-0.5 h-3.5 w-3.5 shrink-0" />{n}</p>)}
+                {m.kind === 'answer' && (
+                  <p className="flex items-center gap-1 text-[9px] font-black uppercase tracking-[.12em] text-guaca-teal">
+                    <BadgeCheck className="h-3 w-3" /> {t.answerTitle}
+                  </p>
+                )}
+                <p className={`mt-1 whitespace-pre-line text-[13px] font-bold leading-relaxed ${m.kind === 'error' ? 'text-guaca-coral-dark' : 'text-guaca-ink'}`}>{m.text}</p>
+                {(m.placeIds ?? []).length > 0 && (
+                  <div className="mt-2.5 flex flex-wrap gap-1.5">
+                    {(m.placeIds ?? []).map((id) => {
+                      const p = placeById(id)
+                      if (!p) return null
+                      const inPlan = plan?.placeIds.includes(id) ?? false
+                      return (
+                        <span key={id} className="inline-flex items-stretch overflow-hidden rounded-full bg-guaca-teal/8">
+                          <button type="button" onClick={() => openPlaceOnMap(id)} className="px-3 py-1.5 text-[10px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                            {(CATEGORY_GLYPH[p.category] ?? { emoji: '📍' }).emoji} {p.name}
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={inPlan ? t.addedToPlan : t.addToPlan}
+                            title={inPlan ? t.addedToPlan : t.addToPlan}
+                            onClick={() => (inPlan ? removeStop(id) : addToPlan(id))}
+                            className="border-l border-guaca-teal/15 px-2 text-guaca-teal hover:bg-guaca-teal/15"
+                          >
+                            {inPlan ? <Check className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
+                          </button>
+                        </span>
+                      )
+                    })}
+                  </div>
+                )}
+                {(m.suggestions ?? []).length > 0 && (
+                  <div className="mt-2 border-t border-guaca-sand pt-2">
+                    <p className="flex items-center gap-1 text-[9px] font-black uppercase tracking-[.12em] text-guaca-ink/40">
+                      <TrendingUp className="h-3 w-3" /> {t.suggestionsTitle}
+                    </p>
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      {(m.suggestions ?? []).map((r) => (
+                        <button
+                          key={r.placeId}
+                          type="button"
+                          title={r.why === 'trending' ? t.whyTrending : r.why === 'asked_about' ? t.whyAskedAbout : t.whyFresh}
+                          onClick={() => openPlaceOnMap(r.placeId)}
+                          className="rounded-full bg-guaca-mango/15 px-3 py-1.5 text-[10px] font-black text-guaca-ocean-deep hover:bg-guaca-mango/30"
+                        >
+                          {r.why === 'trending' ? '🔥' : r.why === 'asked_about' ? '❓' : '✨'} {r.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ),
+          )}
+          {guacaBusy && (
+            <div role="status" className="max-w-[85%] rounded-2xl bg-white p-4 text-sm text-guaca-ink-light">
+              <p className="flex items-center gap-2 font-semibold text-guaca-teal-dark"><Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />{t.asking}</p>
+              <p className="mt-2 leading-relaxed">{lang === 'es' ? 'Estoy consultando los lugares y sus fuentes. Puede tomar un momento.' : 'I’m checking places and their sources. This may take a moment.'}</p>
+            </div>
+          )}
+        </div>
+        {thread.length === 1 && thread[0]?.trigger === 'welcome' && (
+          <div className="mt-3 flex flex-wrap gap-1.5 px-1">
+            {t.guacaSuggestions.map((s) => (
+              <button key={s} type="button" onClick={() => void askGuaca(s)} className="rounded-full bg-guaca-teal/8 px-3 py-1.5 text-[11px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {thread.length > 0 && !guacaBusy && (
+          <button
+            type="button"
+            onClick={() => { setThread([]); saveJson(THREAD_KEY, []) }}
+            className="mx-auto mt-4 block text-[10px] font-bold text-guaca-ink/38 underline-offset-2 hover:underline"
+          >
+            {t.guacaClear}
+          </button>
+        )}
+        <div ref={threadEndRef} />
+      </div>
+
+      <form
+        onSubmit={(e) => { e.preventDefault(); void askGuaca() }}
+        className="guaca-composer shrink-0 px-4 pb-4"
+      >
+        <div className="flex items-end gap-2 rounded-2xl border border-guaca-sand bg-white px-3 py-2 shadow-lg shadow-guaca-ocean-deep/8">
+          <Sparkles aria-hidden="true" className="h-4 w-4 shrink-0 text-guaca-teal/60" />
+          <textarea
+            rows={2}
+            value={guacaText}
+            onChange={(e) => setGuacaText(e.target.value)}
+            placeholder={t.guacaPlaceholder}
+            aria-label={t.guacaPlaceholder}
+            className="min-w-0 flex-1 resize-none border-0 bg-transparent py-1 text-base leading-6 text-guaca-ink outline-none placeholder:text-guaca-ink-light"
+          />
+          <Button type="submit" size="icon" disabled={guacaBusy || !guacaText.trim()} aria-label={lang === 'es' ? 'Enviar mensaje' : 'Send message'} className="h-11 w-11 shrink-0 rounded-full bg-guaca-teal text-white hover:bg-guaca-teal-dark">
+            <Send className="h-4 w-4" />
+          </Button>
+        </div>
+      </form>
+    </div>
+  )
+
+  const renderPlan = () => (
+    <div className="trip-workspace h-full overflow-y-auto bg-guaca-sand-light px-5 pb-8 pt-12 lg:px-[max(1.25rem,calc((100%-44rem)/2))]">
+      <div className="text-guaca-ocean-deep">
+        <h1 className="text-3xl font-semibold tracking-tight">{t.planTitle}</h1>
+        <p className="mt-2 text-sm leading-relaxed text-guaca-ink-light">{t.planLede}</p>
+      </div>
+
+      <PlanInterests selected={interests} onChange={setInterestsPersist} />
+
+      <TouristReservations
+        reservations={reservations}
+        status={bookStatus}
+        onRetry={() => setBookRetry((n) => n + 1)}
+        onOpenPlace={openPlaceOnMap}
+        onDirections={(reservation) => {
+          const stay = reservation.stay
+          const known = stay ? placeById(stay.placeId) : undefined
+          if (known) directionsTo(known)
+        }}
+        onChanged={(reservation) => {
+          setReservations((prev) => prev.map((row) => (row.id === reservation.id ? reservation : row)))
+        }}
+      />
+
+      {!plan ? (trips.length === 0 &&
+        <div className="mt-5 rounded-[28px] border border-dashed border-guaca-teal/28 bg-white/70 p-6 text-center">
+          <Route aria-hidden="true" className="mx-auto h-8 w-8 text-guaca-teal/55" />
+          <h3 className="mt-3 text-[14px] font-black text-guaca-ink">{t.planEmptyTitle}</h3>
+          <p className="mx-auto mt-1 max-w-[250px] text-[11px] font-semibold leading-relaxed text-guaca-ink/50">{t.planEmptyBody}</p>
+          <Button type="button" onClick={() => { setActiveTab('guaca'); void askGuaca(t.guacaSuggestions[0]) }} className="mt-4 h-11 rounded-2xl bg-guaca-teal px-5 text-xs font-black text-white hover:bg-guaca-teal-dark">
+            <Sparkles className="mr-1.5 h-4 w-4" /> {t.planEmptyCta}
+          </Button>
+        </div>
+      ) : (
+        <>
+          <div className="mt-5 rounded-[28px] bg-white p-5 shadow-sm ring-1 ring-guaca-sand/75">
+            <p className="text-[9px] font-black uppercase tracking-[.12em] text-guaca-teal">{t.planFromQuestion}</p>
+            <p className="mt-1 text-[13px] font-black text-guaca-ink">“{plan.question}”</p>
+            {plan.text && (
+              <p className="mt-3 whitespace-pre-line text-[12px] font-semibold leading-relaxed text-guaca-ink/68">{plan.text}</p>
+            )}
+          </div>
+
+          <div className="mt-4">
+            <ItineraryTimeline
+              stops={timelineStops(plan.placeIds)}
+              substitutes={discoveryPlaces.map((place) => ({ id: place.id, name: place.name, category: place.category }))}
+              onOpen={openPlaceOnMap}
+              onRemove={removeStop}
+              onSubstitute={substituteStop}
+            />
+          </div>
+
+          <Button type="button" onClick={sharePlanWa} className="mt-4 h-11 w-full rounded-2xl bg-guaca-teal text-xs font-black text-white hover:bg-guaca-teal-dark">
+            <Share2 className="mr-1.5 h-4 w-4" /> {t.sharePlan}
+          </Button>
+
+          <button
+            type="button"
+            onClick={() => { setPlan(null); localStorage.removeItem(PLAN_KEY) }}
+            className="mx-auto mt-4 block text-[10px] font-bold text-guaca-ink/38 underline-offset-2 hover:underline"
+          >
+            {t.planClear}
+          </button>
+        </>
+      )}
+
+      {/* Saved trips — multi-day itineraries the server keeps per account. */}
+      <div className="mt-7">
+        <h2 className="flex items-center gap-2 text-lg font-semibold text-guaca-ink">
+          <CalendarRange className="h-3.5 w-3.5 text-guaca-teal" /> {t.tripsTitle}
+        </h2>
+        <p className="mt-1 px-1 text-[11px] font-semibold leading-relaxed text-guaca-ink/45">{t.tripsLede}</p>
+
+        {trips.length === 0 ? (
+          <p className="mt-2 rounded-[24px] border border-dashed border-guaca-sand bg-white/60 px-4 py-4 text-center text-[11px] font-semibold text-guaca-ink/45">{t.tripsEmpty}</p>
+        ) : (
+          <div className="mt-3 space-y-3">
+            {trips.map((trip) => {
+              const days = [...new Set(trip.stops.map((s) => s.dayIndex))].sort((a, b) => a - b)
+              return (
+                <div key={trip.id} className="saved-trip rounded-2xl bg-white p-5">
+                  <h3 className="text-lg font-semibold leading-snug text-guaca-ink">{trip.question}</h3>
+                  {days.map((d) => (
+                    <div key={d} className="mt-2.5">
+                      <p className="text-[9px] font-black uppercase tracking-[.12em] text-guaca-teal">{t.tripDay} {d + 1}</p>
+                      <ItineraryTimeline
+                        stops={timelineStops(
+                          trip.stops.filter((s) => s.dayIndex === d).sort((a, b) => a.startMin - b.startMin).map((s) => s.placeId),
+                          trip.stops.filter((s) => s.dayIndex === d),
+                        )}
+                        substitutes={[]}
+                        onOpen={openPlaceOnMap}
+                        onRemove={() => {}}
+                        onSubstitute={() => {}}
+                        editable={false}
+                      />
+                    </div>
+                  ))}
+                  <div className="mt-3 flex gap-2">
+                    <Button type="button" onClick={() => shareTripWa(trip)} className="h-9 flex-1 rounded-2xl bg-guaca-teal text-[10px] font-black text-white hover:bg-guaca-teal-dark">
+                      <Share2 className="mr-1 h-3.5 w-3.5" /> {t.tripShare}
+                    </Button>
+                    <button
+                      type="button"
+                      aria-label={t.tripDelete}
+                      disabled={deletingTrip !== null}
+                      title={t.tripDelete}
+                      onClick={() => void deleteTripCall(trip.id)}
+                      className="grid h-9 w-9 place-items-center rounded-2xl bg-guaca-ink/5 text-guaca-ink/45 hover:bg-guaca-coral/12 hover:text-guaca-coral-dark"
+                    >
+                      {deletingTrip === trip.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {tripDeleteError && <p role="alert" className="mt-3 text-sm text-guaca-coral-dark">{lang === 'es' ? 'No se pudo eliminar el viaje. Sigue guardado; inténtalo de nuevo.' : 'The trip couldn’t be deleted. It is still saved; please try again.'}</p>}
+        {/* Plan a trip — days, pace, and the same guarded pipeline. */}
+        <div className="mt-4 rounded-[28px] border border-dashed border-guaca-teal/28 bg-white/70 p-4">
+          <div className="flex items-center gap-2">
+            <input
+              value={tripText}
+              onChange={(e) => setTripText(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') void planTripCall() }}
+              placeholder={t.guacaPlaceholder}
+              aria-label={lang === 'es' ? 'Describe tu viaje' : 'Describe your trip'}
+              className="min-w-0 flex-1 rounded-2xl border border-guaca-sand bg-white px-3.5 py-2.5 text-[12px] font-bold text-guaca-ink outline-none placeholder:text-guaca-ink/30 focus:border-guaca-teal/50"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] font-black uppercase tracking-[.12em] text-guaca-ink/40">{t.tripDaysLabel}</span>
+              {[1, 2, 3, 5, 7].map((d) => (
+                <button
+                  key={d}
+                  type="button"
+                  onClick={() => setTripDays(d)}
+                  aria-pressed={tripDays === d}
+                  aria-label={`${d} ${t.tripDaysLabel.toLowerCase()}`}
+                  className={`h-7 w-7 rounded-full text-[11px] font-black ${tripDays === d ? 'bg-guaca-teal text-white' : 'bg-guaca-teal/8 text-guaca-teal hover:bg-guaca-teal/15'}`}
+                >
+                  {d}
+                </button>
+              ))}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] font-black uppercase tracking-[.12em] text-guaca-ink/40">{t.tripPaceLabel}</span>
+              {([['relaxed', t.paceRelaxed], ['balanced', t.paceBalanced], ['packed', t.pacePacked]] as Array<[TripPaceChoice, string]>).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setTripPace(value)}
+                  aria-pressed={tripPace === value}
+                  className={`rounded-full px-3 py-1.5 text-[10px] font-black ${tripPace === value ? 'bg-guaca-ocean text-white' : 'bg-guaca-ocean/8 text-guaca-ocean hover:bg-guaca-ocean/15'}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <Button type="button" disabled={tripBusy || tripText.trim().length === 0} onClick={() => void planTripCall()} className="mt-3 h-10 w-full rounded-2xl bg-guaca-mango text-[11px] font-black text-guaca-ocean-deep hover:bg-guaca-mango-light disabled:opacity-45">
+            <Sparkles className="mr-1.5 h-4 w-4" /> {tripBusy ? t.tripPlanning : t.planTripCta}
+          </Button>
+          {tripErr && (
+            <p className="mt-2 rounded-2xl bg-guaca-ocean-deep/90 px-3.5 py-2.5 text-[11px] font-bold leading-relaxed text-white">{t.tripRefused}</p>
+          )}
+        </div>
+      </div>
+
+      {/* Saved places — the ♥ list, private to this account. */}
+      <div className="mt-6">
+        <p className="flex items-center gap-1.5 px-1 text-[11px] font-black uppercase tracking-[.1em] text-guaca-ink/50">
+          <Heart className="h-3.5 w-3.5 text-guaca-coral" /> {t.favTitle}
+        </p>
+        {favorites.length === 0 ? (
+          <p className="mt-2 rounded-[24px] border border-dashed border-guaca-sand bg-white/60 px-4 py-4 text-center text-[11px] font-semibold text-guaca-ink/45">{t.favEmpty}</p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {favorites.map((f) => {
+              const glyph = CATEGORY_GLYPH[f.category] ?? { emoji: '📍', color: '#0D8B8B' }
+              return (
+                <div key={f.placeId} className="flex items-center gap-3 rounded-[24px] bg-white p-3 shadow-sm ring-1 ring-guaca-sand/75">
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl text-base" style={{ backgroundColor: `${glyph.color}18` }}>{glyph.emoji}</span>
+                  <p className="min-w-0 flex-1 truncate text-[13px] font-black text-guaca-ink">{f.name}</p>
+                  <button type="button" onClick={() => openPlaceOnMap(f.placeId)} className="shrink-0 rounded-full bg-guaca-teal/8 px-3 py-2 text-[10px] font-black text-guaca-teal hover:bg-guaca-teal/15">
+                    {t.planViewOnMap}
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={t.favSaved}
+                    onClick={() => toggleFavorite({ id: f.placeId, name: f.name, category: f.category, lat: f.lat, lon: f.lon } as ApiPlace)}
+                    className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-guaca-coral/10 text-guaca-coral hover:bg-guaca-coral/20"
+                  >
+                    <Heart className="h-3.5 w-3.5 fill-guaca-coral" />
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+
+  const renderProfile = () => (
+    <div className="h-full overflow-y-auto bg-guaca-sand-light px-5 pb-8 pt-12 lg:px-[max(1.25rem,calc((100%-44rem)/2))]">
+      <div className="rounded-[32px] bg-white p-6 text-center shadow-sm ring-1 ring-guaca-sand/75">
+        {me?.profile ? (
+          <img src={me.profile.avatarUrl} alt={me.profile.name} width={96} height={96} className="mx-auto h-24 w-24 rounded-full object-cover" />
+        ) : <span className="mx-auto grid h-16 w-16 place-items-center rounded-full bg-guaca-teal text-2xl font-black text-white">
+          {(me?.email?.[0] ?? '·').toUpperCase()}
+        </span>}
+        <h2 className="mt-3 truncate text-xl font-black text-guaca-ink">{me?.profile?.name ?? me?.email ?? '…'}</h2>
+        {me?.profile && <>
+          <p className="mt-1 text-sm text-guaca-teal-dark">{me.profile.home}</p>
+          <p className="mx-auto mt-3 max-w-md text-base leading-relaxed text-guaca-ink">{lang === 'es' ? me.profile.bioEs : me.profile.bioEn}</p>
+          <p className="mt-3 text-sm text-guaca-ink/70">{me.email}</p>
+        </>}
+        {me?.propertyName && (
+          <p className="mt-1 text-[11px] font-bold text-guaca-teal">{t.profileGuestOf} {me.propertyName}</p>
+        )}
+      </div>
+
+      <div className="mt-4">
+        <InstallApp />
+      </div>
+
+      <TouristEntitlement />
+
+      {/* Impact — the loop, made personal. */}
+      <div className="mt-4 rounded-[28px] bg-gradient-to-br from-guaca-ocean to-guaca-ocean-deep p-5 text-white shadow-lg">
+        <p className="text-[10px] font-black uppercase tracking-[.14em] text-white/75">{t.impactTitle}</p>
+        <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+          <div className="rounded-2xl bg-white/10 px-2 py-3">
+            <p className="text-xl font-black">{stats.asked}</p>
+            <p className="mt-0.5 text-[9px] font-bold leading-tight text-white/70">{t.impactAsked}</p>
+          </div>
+          <div className="rounded-2xl bg-white/10 px-2 py-3">
+            <p className="text-xl font-black text-guaca-mango-light">{stats.commissioned}</p>
+            <p className="mt-0.5 text-[9px] font-bold leading-tight text-white/70">{t.impactCommissioned}</p>
+          </div>
+          <div className="rounded-2xl bg-white/10 px-2 py-3">
+            <p className="text-xl font-black text-guaca-mango-light">{fulfilled}</p>
+            <p className="mt-0.5 text-[9px] font-bold leading-tight text-white/70">{t.impactVerified}</p>
+          </div>
+        </div>
+        <p className="mt-2.5 text-[9px] font-semibold leading-relaxed text-white/55">{t.impactNote}</p>
+      </div>
+
+      {/* Watches — questions a local is going out to answer. */}
+      <div className="mt-4">
+        <p className="flex items-center gap-1.5 px-1 text-[11px] font-black uppercase tracking-[.1em] text-guaca-ink/50">
+          <Bell className="h-3.5 w-3.5 text-guaca-mango-dark" /> {t.watchingTitle}
+        </p>
+        {watching.length === 0 ? (
+          <p className="mt-2 rounded-[24px] border border-dashed border-guaca-sand bg-white/60 px-4 py-4 text-center text-[11px] font-semibold text-guaca-ink/45">{t.watchingEmpty}</p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {watching.map((w) => (
+              <div key={w.questionId} className="flex items-center gap-3 rounded-[24px] bg-white p-3.5 shadow-sm ring-1 ring-guaca-sand/75">
+                <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-guaca-mango/15 text-guaca-mango-dark">
+                  <Clock3 className="h-4 w-4" />
+                </span>
+                <p className="min-w-0 flex-1 truncate text-[12px] font-bold text-guaca-ink">{w.text}</p>
+                <button type="button" onClick={() => cancelWatch(w.questionId)} className="shrink-0 rounded-full bg-guaca-ink/5 px-3 py-1.5 text-[9px] font-black text-guaca-ink/50 hover:bg-guaca-ink/10">
+                  {t.watchingCancel}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Their own posts — the travel passport. */}
+      <div className="mt-4">
+        <p className="flex items-center gap-1.5 px-1 text-[11px] font-black uppercase tracking-[.1em] text-guaca-ink/50">
+          <MessageCircle className="h-3.5 w-3.5 text-guaca-teal" /> {t.myPostsTitle}
+        </p>
+        {myPosts.length === 0 ? (
+          <p className="mt-2 rounded-[24px] border border-dashed border-guaca-sand bg-white/60 px-4 py-4 text-center text-[11px] font-semibold text-guaca-ink/45">{t.myPostsEmpty}</p>
+        ) : (
+          <div className="mt-2 space-y-2">
+            {myPosts.map((p) => (
+              <button key={p.id} type="button" onClick={() => openPlaceOnMap(p.place_id)} className="flex w-full items-center gap-3 rounded-[24px] bg-white p-3.5 text-left shadow-sm ring-1 ring-guaca-sand/75 hover:bg-guaca-sand/20">
+                <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-guaca-teal/10 text-base">
+                  {(CATEGORY_GLYPH[p.category] ?? { emoji: '📍' }).emoji}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-1.5">
+                    <span className="truncate text-[12px] font-black text-guaca-ink">{p.place_name}</span>
+                    {p.visited && <MapPin className="h-3 w-3 shrink-0 text-guaca-mango-dark" />}
+                    {p.rating != null && (
+                      <span className="flex shrink-0 items-center gap-0.5 text-[10px] font-black text-guaca-mango-dark">
+                        <Star className="h-3 w-3 fill-guaca-mango text-guaca-mango" />{p.rating}
+                      </span>
+                    )}
+                  </span>
+                  <span className="mt-0.5 block truncate text-[10px] font-semibold text-guaca-ink/50">{p.body}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 overflow-hidden rounded-[28px] bg-white shadow-sm ring-1 ring-guaca-sand/75">
+        <div className="flex items-center justify-between gap-3 px-5 py-4">
+          <span className="flex items-center gap-2.5 text-[13px] font-black text-guaca-ink">
+            <Globe className="h-4.5 w-4.5 text-guaca-teal" /> {t.profileLanguage}
+          </span>
+          <div className="flex overflow-hidden rounded-full bg-guaca-sand/60 p-0.5">
+            {(['en', 'es'] as const).map((code) => (
+              <button
+                key={code}
+                type="button"
+                onClick={() => changeLanguage(code)}
+                aria-pressed={lang === code}
+                className={`rounded-full px-3.5 py-1.5 text-[11px] font-black transition-colors ${lang === code ? 'bg-guaca-teal text-white' : 'text-guaca-ink/55'}`}
+              >
+                {code.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="h-px bg-guaca-sand/60" />
+        <button type="button" onClick={() => setActiveTab('updates')} className="flex w-full items-center justify-between gap-3 px-5 py-4 text-left hover:bg-guaca-sand/25">
+          <span className="flex items-center gap-2.5 text-[13px] font-black text-guaca-ink">
+            <Megaphone className="h-4.5 w-4.5 text-guaca-teal" /> {t.profileUpdates}
+          </span>
+          {updates.length > 0 && <span className="rounded-full bg-guaca-coral/12 px-2 py-0.5 text-[10px] font-black text-guaca-coral-dark">{updates.length}</span>}
+        </button>
+      </div>
+
+      {/* Yummy-style mode switch — Spotter is the only in-app second role;
+          businesses register on the website, never here. */}
+      <button
+        type="button"
+        onClick={() => { window.location.href = '/spotter' }}
+        className="mt-4 flex w-full items-center gap-3 rounded-[28px] bg-gradient-to-r from-guaca-coral to-guaca-mango p-4 text-left shadow-lg shadow-guaca-coral/20 transition-transform hover:-translate-y-0.5"
+      >
+        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-white/20 text-white">
+          <Trophy className="h-5 w-5" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block text-[13px] font-black text-white">{t.profileBecomeSpotter}</span>
+          <span className="mt-0.5 block text-[10px] font-bold leading-relaxed text-white/85">{t.profileBecomeSpotterNote}</span>
+        </span>
+        <ArrowRight className="h-4 w-4 shrink-0 text-white/80" />
+      </button>
+
+      <div className="mt-4 overflow-hidden rounded-[28px] bg-white shadow-sm ring-1 ring-guaca-sand/75">
+        <button type="button" onClick={() => void signOut()} className="flex w-full items-center gap-2.5 px-5 py-4 text-left text-[13px] font-black text-guaca-ink hover:bg-guaca-sand/25">
+          <LogOut className="h-4.5 w-4.5 text-guaca-ocean" /> {t.profileSignOut}
+        </button>
+        <div className="h-px bg-guaca-sand/60" />
+        <a href={`${LANDING_URL}/delete-account`} target="_blank" rel="noopener noreferrer" className="flex w-full items-start gap-2.5 px-5 py-4 text-left hover:bg-guaca-sand/25">
+          <Trash2 className="mt-0.5 h-4.5 w-4.5 shrink-0 text-guaca-coral" />
+          <span>
+            <span className="block text-[13px] font-black text-guaca-coral-dark">{t.profileDelete}</span>
+            <span className="mt-0.5 block text-[10px] font-semibold leading-relaxed text-guaca-ink/45">{t.profileDeleteNote}</span>
+          </span>
+        </a>
+      </div>
+
+      {/* Link a stay after the fact — for guests who never scanned the QR. */}
+      {!me?.propertyName && (
+        <div className="mt-4 rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-guaca-sand/75">
+          <label htmlFor="villa-code" className="block text-[11px] font-black text-guaca-ink/70">
+            {t.villaCodeLabel}
+          </label>
+          <div className="mt-2 flex gap-2">
+            <Input
+              id="villa-code"
+              value={villaCode}
+              onChange={(e) => setVillaCode(e.target.value)}
+              placeholder="qr-XXXXXXXX"
+              className="h-10 flex-1 rounded-xl border-guaca-sand text-[12px]"
+            />
+            <Button type="button" onClick={() => void linkVilla()} disabled={!villaCode.trim()} className="h-10 rounded-xl bg-guaca-teal px-4 text-[11px] font-black text-white hover:bg-guaca-teal-dark">
+              {t.villaCodeCta}
+            </Button>
+          </div>
+          {villaErr && <p className="mt-2 text-[10px] font-bold text-guaca-coral-dark">{t.villaCodeBad}</p>}
+        </div>
+      )}
+
+      {/* Legal — Play requires a reachable privacy policy. */}
+      <div className="mt-5 flex items-center justify-center gap-4 text-[11px] font-bold text-guaca-ink/45">
+        <a href={`${LANDING_URL}/privacy`} target="_blank" rel="noopener noreferrer" className="underline-offset-2 hover:underline">
+          {t.legalPrivacy}
+        </a>
+        <span aria-hidden="true">·</span>
+        <a href={`${LANDING_URL}/terms`} target="_blank" rel="noopener noreferrer" className="underline-offset-2 hover:underline">
+          {t.legalTerms}
+        </a>
+      </div>
+    </div>
+  )
+
+  const filteredUpdates = useMemo(() => {
+    const normalized = query.trim().toLowerCase()
+    if (!normalized) return updates
+    return updates.filter((update) =>
+      [update.businessName, update.community, update.title, update.details, update.category]
+        .join(' ')
+        .toLowerCase()
+        .includes(normalized),
+    )
+  }, [query, updates])
+
+  const renderUpdates = () => (
+    <div className="h-full overflow-y-auto bg-guaca-sand-light px-5 pb-8 pt-14">
+      <div className="rounded-[32px] bg-gradient-to-br from-guaca-teal to-guaca-ocean p-6 text-white shadow-xl shadow-guaca-teal/18">
+        <GuacaMark className="h-12 w-auto" />
+        <h1 className="mt-3 text-3xl font-black tracking-[-.04em]">{t.updatesTitle}</h1>
+        <p className="mt-3 text-sm font-semibold leading-relaxed text-white/88">{t.updatesLede}</p>
+      </div>
+
+      <div className="relative mt-5">
+        <Search aria-hidden="true" className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-guaca-teal" />
+        <Input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t.updatesSearch} className="h-12 rounded-2xl border-guaca-sand bg-white pl-11 focus-visible:ring-guaca-teal" />
+      </div>
+
+      {filteredUpdates.length === 0 ? (
+        <div className="mt-4 rounded-[28px] border border-dashed border-guaca-teal/28 bg-white/60 p-6 text-center">
+          <Store aria-hidden="true" className="mx-auto h-8 w-8 text-guaca-teal/55" />
+          <h3 className="mt-4 text-[13px] font-black text-guaca-ink">{updates.length === 0 ? t.updatesEmpty : t.updatesEmptySearch}</h3>
+          <p className="mx-auto mt-2 max-w-[260px] text-[11px] font-semibold leading-relaxed text-guaca-ink/48">{t.updatesLede}</p>
+        </div>
+      ) : (
+        <div className="mt-4 space-y-3">
+          {filteredUpdates.map((update) => (
+            <article key={update.id} className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-guaca-sand/75">
+              <div className="flex items-center justify-between gap-3">
+                <span className="rounded-full bg-guaca-teal/8 px-2.5 py-1 text-[9px] font-black text-guaca-teal">{update.category}</span>
+                <span className={`flex items-center gap-1 text-[9px] font-black ${update.status === 'verified' ? 'text-emerald-700' : 'text-guaca-ink/42'}`}>
+                  {update.status === 'verified' ? <BadgeCheck aria-hidden="true" className="h-3.5 w-3.5" /> : <Clock3 aria-hidden="true" className="h-3.5 w-3.5" />}
+                  {update.status === 'verified' ? `${t.updatesVerifiedBy} ${update.verifiedBy}` : t.updatesPublished}
+                </span>
+              </div>
+              <p className="mt-3 text-[10px] font-black text-guaca-teal-dark">{update.businessName}{update.community ? ` · ${update.community}` : ''}</p>
+              <h3 className="mt-1 text-[14px] font-black leading-snug text-guaca-ink">{update.title}</h3>
+              <p className="mt-2 text-[11px] font-medium leading-relaxed text-guaca-ink/60">{update.details}</p>
+              <p className="mt-3 text-[9px] font-semibold text-guaca-ink/38">{formatUpdateTime(update.createdAt)}</p>
+            </article>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+
+  const tabScreens: Record<Tab, () => ReturnType<typeof renderMap>> = {
+    map: renderMap,
+    guaca: renderGuaca,
+    plan: renderPlan,
+    profile: renderProfile,
+    updates: renderUpdates,
+  }
+
+  return (
+    <MobileViewport className="tourist-workspace relative flex h-dvh flex-col overflow-hidden bg-guaca-paper lg:flex-row">
+      {/* min-h-0 lets this region scroll instead of growing the page and
+          pushing the tab bar past the fold. */}
+      <div className="relative min-h-0 flex-1 lg:order-2">{tabScreens[activeTab]()}</div>
+      <div className="tourist-navigation relative z-[500] shrink-0 border-t border-guaca-sand/70 bg-guaca-sand-light px-3 pb-3 pt-2 lg:order-1 lg:flex lg:w-24 lg:flex-col lg:border-r lg:border-t-0 lg:px-2 lg:py-6">
+        <a href="/" className="mb-6 hidden flex-col items-center gap-1 lg:flex" aria-label="Guaca">
+          <img src="/brand/guaca-mark.png" alt="" className="h-12 w-12 object-contain" />
+          <span className="text-[15px] font-black lowercase tracking-tight text-guaca-teal">guaca</span>
+        </a>
+        <div className="flex items-center justify-around lg:flex-col lg:justify-start lg:gap-5">
+          {[
+            { id: 'map' as const, label: t.tabMap, icon: MapPin },
+            { id: 'guaca' as const, label: t.tabGuaca, icon: Sparkles },
+            { id: 'plan' as const, label: t.tabPlan, icon: Route },
+            { id: 'profile' as const, label: t.tabProfile, icon: UserRound },
+          ].map((tab) => {
+            const Icon = tab.icon
+            const active = activeTab === tab.id
+            return <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)} aria-label={tab.label} aria-current={active ? 'page' : undefined} className={`relative inline-flex h-14 min-w-16 flex-col items-center justify-center gap-1 rounded-xl px-3 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-guaca-teal lg:h-[76px] lg:w-20 ${active ? 'bg-guaca-teal/10 text-guaca-teal' : 'text-guaca-ink-light hover:bg-guaca-sand'}`}><Icon className={`h-5 w-5 lg:h-6 lg:w-6 ${active ? 'fill-guaca-teal/10' : ''}`} />{tab.label}{tab.id === 'guaca' && unreadFirst > 0 && <span aria-label={String(unreadFirst)} className="absolute right-3 top-2 h-2.5 w-2.5 rounded-full bg-guaca-coral ring-2 ring-white lg:right-5 lg:top-3" />}</button>
+          })}
+        </div>
+        <RailArt />
+      </div>
+    </MobileViewport>
+  )
+}

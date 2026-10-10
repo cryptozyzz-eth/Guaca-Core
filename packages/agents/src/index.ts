@@ -1,0 +1,67 @@
+export { Catalog } from './catalog/catalog.js';
+export type { PlaceId, CatalogEntry, CatalogRow } from './catalog/catalog.js';
+export { PlanDraft, ReasonCode, MAX_DAYS, MAX_STOPS_PER_DAY, MAX_STOPS_TOTAL } from './guard/planDraft.js';
+export { assertGrounded, GuardViolation } from './guard/assertGrounded.js';
+export type { GuardViolationCode, GuardCtx, PlanArtifact, PlaceRowForGuard } from './guard/assertGrounded.js';
+export { lexicalSweep, normaliseForSweep } from './guard/lexicalSweep.js';
+export { renderItinerary } from './render/itinerary.js';
+export { groundFromVerifiedRows } from './guard/assertGrounded.js';
+export type { RenderPlace } from './render/itinerary.js';
+export type { Inference, JsonRequest, JsonResult, VisionRequest } from './inference/types.js';
+export { FakeInference } from './inference/fake.js';
+export { RunBudget, BudgetExceeded, routeBudgetExceeded } from './inference/budget.js';
+export type { BudgetLimits, RefusalArtifact } from './inference/budget.js';
+export { OpenAICompatibleProvider, createProvider } from './inference/openai.js';
+export type { OpenAICompatibleOptions, ProviderEnv } from './inference/openai.js';
+export { AdversarialInference } from './inference/adversarial.js';
+export type { AdversarialStrategy } from './inference/adversarial.js';
+export { detectInjection } from './inference/injection.js';
+export type { InjectionSignal } from './inference/injection.js';
+export { phash64, hammingDistance, sha256Hex, hashPhoto } from './verification/phash.js';
+export { checkFreshness, checkGeoDistance } from './verification/rungs12.js';
+export type { FreshnessVerdict, GeoDistanceResult } from './verification/rungs12.js';
+export { checkPhotoReuse, checkIntraDiversity, nameSimilarity } from './verification/rungs34.js';
+export { fuseTrust, decideSubmission } from './verification/fusion.js';
+export type { VisionVerdict, FusionInput, SubmissionDecision } from './verification/fusion.js';
+export { VerificationAgent } from './verification/agent.js';
+export type { VerificationInput, VerificationOutcome, VerificationRunEvent } from './verification/agent.js';
+export { Runner, InterruptSignal } from './runtime/runner.js';
+export type { Node, NodeState, RunnerOptions } from './runtime/runner.js';
+export { extractIntent, classifiesIntent, classifyWithModel, categoryHits, parseIntent, IntentSchema } from './planner/intent.js';
+export type { Intent } from './planner/intent.js';
+export { answerDeterministic, greedyRoute } from './planner/fastPath.js';
+export type { FastPathPlace, FastPathPlan, FastPathStop, FastPathResult } from './planner/fastPath.js';
+export { runPlanner } from './planner/planner.js';
+export type { PlannerInput, PlannerDb, PlannerOutcome } from './planner/planner.js';
+export { runGroundedPlanner } from './planner/groundedPlanner.js';
+export { answerFromCatalog } from './planner/pipeline.js';
+export { converse, narrateRefusal, speakFirst, guessLang, ConciergeSchema, RefusalNarrationSchema } from './planner/concierge.js';
+export type { ConciergeTurn, ConciergeInput } from './planner/concierge.js';
+export type { CatalogPlace, PipelineOptions, PipelineOutcome, AnswerPath, RefusalStage } from './planner/pipeline.js';
+export type { GroundedPlannerOptions, GroundedOutcome } from './planner/groundedPlanner.js';
+export { selectSpotter, type SpotterCandidate } from './gap/spotterSelection.js';
+export { composeBrief, type BriefInput } from './gap/brief.js';
+export { runGapAgent, type GapAgentOptions, type GapAgentResult, type GapRow } from './gap/agent.js';
+export { scoreGap, HARD_GATES, SCARCITY_EXPONENT, type GapSignals, type ScoredGap } from './gap/scoring.js';
+export {
+  scoreTrends,
+  weatherMultiplier,
+  TREND_VERSION,
+  TRENDING_SCORE_MIN,
+  ENGAGEMENT_HALF_LIFE_DAYS,
+  INTEREST_HALF_LIFE_DAYS,
+  type TrendSignals,
+  type WeatherState,
+  type TrendBadge,
+  type ScoredTrend,
+} from './trends/score.js';
+export { draftCandidate, CandidateDraftSchema } from './steward/draft.js';
+export type { CandidateDraft, CandidateInput, DraftOutcome } from './steward/draft.js';
+export { analyzeMapHealth } from './health/analyze.js';
+export type { MapHealthStats, MapHealthAnalysis, HealthFinding, HealthFindingKind, MissionCandidate } from './health/analyze.js';
+export { narrateMapHealth } from './health/narrate.js';
+export type { HealthNarrative } from './health/narrate.js';
+export { runPlannerEval } from './eval/plannerEval.js';
+export type { EvalSummary, EvalCaseResult } from './eval/plannerEval.js';
+export { EVAL_CASES, EVAL_SET, FIXTURE_ROWS, FIXTURE_ORIGIN } from './eval/plannerSet.js';
+export type { EvalCase, EvalExpect } from './eval/plannerSet.js';

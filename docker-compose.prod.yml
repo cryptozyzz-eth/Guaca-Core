@@ -1,0 +1,147 @@
+# GUACA — app stack (api + postgres + minio) for ONE tier.
+# §4.3: the same file runs twice on the VM as separate compose projects:
+#   ./infra/deploy.sh prod      → project guaca-prod,    infra/env/prod.env
+#   ./infra/deploy.sh staging   → project guaca-staging, infra/env/staging.env
+# TLS/routing lives in docker-compose.edge.yml (shared Caddy on guaca-edge).
+# Variables with :? are required — compose refuses to start if they are
+# empty, so a half-filled env file fails loudly instead of booting with
+# blank secrets.
+services:
+  postgres:
+    # PostGIS + h3 (see infra/postgres.Dockerfile) — the stock postgis image
+    # has no h3 and the first migration fails on it.
+    build:
+      context: .
+      dockerfile: infra/postgres.Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-guaca}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in infra/env/<tier>.env}
+      POSTGRES_DB: guaca
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h forces a TCP check. Without it pg_isready answers over the unix
+      # socket during Postgres's first-boot init phase, so the container is
+      # reported healthy before it accepts network connections and the
+      # migration step dies with ECONNREFUSED.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-guaca} -d guaca"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set in infra/env/<tier>.env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set in infra/env/<tier>.env}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    build:
+      context: .
+      dockerfile: infra/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-guaca}:${POSTGRES_PASSWORD}@postgres:5432/guaca
+      API_PORT: 3001
+      NODE_ENV: production
+      WEB_ORIGIN: ${WEB_ORIGIN:?set in infra/env/<tier>.env}
+      INFERENCE_BASE_URL: ${INFERENCE_BASE_URL:?set in infra/env/<tier>.env}
+      INFERENCE_API_KEY: ${INFERENCE_API_KEY:?set in infra/env/<tier>.env}
+      INFERENCE_MODEL: ${INFERENCE_MODEL:?set in infra/env/<tier>.env}
+      INFERENCE_VISION_MODEL: ${INFERENCE_VISION_MODEL:?set in infra/env/<tier>.env}
+      INFERENCE_TIMEOUT_MS: 30000
+      INFERENCE_MAX_RETRIES: 2
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      # One sender per purpose; EMAIL_FROM stays the fallback for both.
+      EMAIL_FROM_LOGIN: ${EMAIL_FROM_LOGIN:-}
+      EMAIL_FROM_HELLO: ${EMAIL_FROM_HELLO:-}
+      EMAIL_REPLY_TO: ${EMAIL_REPLY_TO:-}
+      # Store-review sign-in: app reviewers cannot receive email codes.
+      # Inert unless set (see docs/PLAY_RELEASE.md).
+      REVIEW_EMAIL: ${REVIEW_EMAIL:-}
+      REVIEW_CODE: ${REVIEW_CODE:-}
+      REVIEW_SPOTTER_EMAIL: ${REVIEW_SPOTTER_EMAIL:-}
+      SHOWCASE_ACCESS_ENABLED: ${SHOWCASE_ACCESS_ENABLED:-false}
+      SHOWCASE_ACCESS_CODE: ${SHOWCASE_ACCESS_CODE:-}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-guaca-photos}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      SESSION_SECRET: ${SESSION_SECRET:?set in infra/env/<tier>.env}
+      OPERATOR_TOKEN: ${OPERATOR_TOKEN:?set in infra/env/<tier>.env}
+      # Knobs actually read by apps/api/src/index.ts — keep this list honest.
+      GAP_AGENT_ENABLED: ${GAP_AGENT_ENABLED:-true}
+      GAP_AGENT_DRY_RUN: ${GAP_AGENT_DRY_RUN:-false}
+      GAP_AGENT_INTERVAL_MS: ${GAP_AGENT_INTERVAL_MS:-300000}
+      # score is 0–100 (see index.ts default 45)
+      GAP_AGENT_MIN_SCORE: ${GAP_AGENT_MIN_SCORE:-45}
+      GAP_AGENT_MAX_MISSIONS_PER_DAY: ${GAP_AGENT_MAX_MISSIONS_PER_DAY:-5}
+      GAP_AGENT_MAX_REWARD_MINOR: ${GAP_AGENT_MAX_REWARD_MINOR:-500}
+      MISSION_EXPIRY_HOURS: ${MISSION_EXPIRY_HOURS:-48}
+      PLANNER_MIN_CANDIDATES: ${PLANNER_MIN_CANDIDATES:-3}
+      # Trend engine weather modulation (Open-Meteo; off = scores run weather-free).
+      WEATHER_ENABLED: ${WEATHER_ENABLED:-true}
+      ROUTING_URL: ${ROUTING_URL:-}
+      TRAVELLER_TICK_ENABLED: ${TRAVELLER_TICK_ENABLED:-true}
+      TRAVELLER_TICK_MS: ${TRAVELLER_TICK_MS:-900000}
+      WEATHER_BASE_URL: ${WEATHER_BASE_URL:-https://api.open-meteo.com}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:?set in infra/env/<tier>.env}:3001"
+    networks:
+      default: {}
+      edge:
+        # Caddy proxies to this name (guaca-prod-api / guaca-staging-api).
+        # Required: a defaulted alias would let a misconfigured staging
+        # answer as prod on the shared network.
+        aliases:
+          - ${EDGE_ALIAS:?set in infra/env/<tier>.env}
+    # Restart policy + rotation are inherited concerns of a long-lived box:
+    # a reboot or a chatty cycle must never wedge or fill the VM disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Readiness, not just liveness: the DB must actually answer.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+networks:
+  default: {}
+  edge:
+    external: true
+    name: guaca-edge
+
+volumes:
+  pgdata:
+  miniodata:

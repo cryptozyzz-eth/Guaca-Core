@@ -1,0 +1,30 @@
+# GUACA — shared Caddy for both tiers (docker-compose.edge.yml).
+# Domains/email come from infra/env/edge.env; upstreams are the compose
+# network aliases set by EDGE_ALIAS in each tier's env file.
+{
+	email {$ACME_EMAIL:admin@guaca.live}
+}
+
+{$API_DOMAIN:api.guaca.live} {
+	# Transport and browser hardening for every response the edge serves.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy guaca-prod-api:3001
+}
+
+{$STAGING_API_DOMAIN:staging.api.guaca.live} {
+	# Transport and browser hardening for every response the edge serves.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy guaca-staging-api:3001
+}

@@ -1,0 +1,1036 @@
+import { useEffect, useMemo, useRef } from 'react'
+import mapboxgl from 'mapbox-gl'
+import 'mapbox-gl/dist/mapbox-gl.css'
+
+const MAPBOX_TOKEN = (process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? '').trim()
+
+if (MAPBOX_TOKEN) mapboxgl.accessToken = MAPBOX_TOKEN
+
+interface MapPin {
+  id: string
+  lat: number
+  lng: number
+  emoji: string
+  iconSvg?: string
+  label: string
+  spotterColor: string
+  spotterInitials: string
+  verified: boolean
+  /** A place photograph: the pin becomes a round photo chip (color stays as
+   *  the ring and the load-failure fallback). Verified places only; a
+   *  candidate keeps its lighter category dot. */
+  photoUrl?: string
+  /** A curated PUBLIC LISTING, not a local verification: a photo-backed or
+   *  category-glyph marker that never shows the green check, a witness
+   *  avatar, a rating or a trend badge. A photo describes a place; it is
+   *  not evidence anyone stood there. */
+  listed?: boolean
+  /** e.g. "4.5" — shown as a small ★ badge when review activity exists. */
+  ratingBadge?: string
+  /** Trend-engine badge — shown as a small 🔥 mark on the pin. */
+  trendBadge?: string | null
+}
+
+interface GapPin {
+  id: string
+  lat: number
+  lng: number
+  label: string
+  asks: number
+  category: string
+}
+
+/**
+ * A country-level coverage marker — an honest claim, not a place pin.
+ * Shown only when the map is zoomed out (zoom ≤ 5.5); zooming in hands
+ * the canvas back to verified pins and unverified candidate dots.
+ */
+export interface CountryMarker {
+  code: string
+  label: string
+  status: 'live' | 'planned' | 'uncovered'
+  statusLabel: string
+  lat: number
+  lng: number
+}
+
+/**
+ * A tappable zone marker — the area picker, directly on the map. Visible
+ * in the mid-zoom band (5.5 < zoom ≤ 9): countries at low zoom hand over
+ * to their zones as you zoom in, so a person can go basin → country →
+ * zone without ever opening the menu.
+ */
+export interface ZoneMarker {
+  id: string
+  label: string
+  lat: number
+  lng: number
+  selected?: boolean
+}
+
+/**
+ * An operator overlay marker: a mission at its target cell, a place waiting
+ * for its second witness, a spotter's home cell, a paying property, a
+ * reported post. Not a place pin (nothing here is a verified claim) and not
+ * a gap (that is demand). A round badge with a glyph, coloured by kind.
+ */
+export interface OverlayMarker {
+  id: string
+  lat: number
+  lng: number
+  label: string
+  emoji: string
+  /** Ring and badge colour. */
+  color: string
+  /** Small count or status shown top-right, e.g. "3" or "offered". */
+  badge?: string
+  /** Hollow ring instead of a filled disc: something not yet proven. */
+  hollow?: boolean
+}
+
+/** Unverified candidates (OSM import) — rendered as a GPU circle layer,
+ *  never as DOM markers: there can be hundreds. */
+interface MapDot {
+  id: string
+  lat: number
+  lng: number
+  label: string
+  category: string
+}
+
+/** Review-activity heat: weight = posts/reviews at that spot. */
+interface HeatPoint {
+  lat: number
+  lng: number
+  weight: number
+}
+
+export const MAP_STYLES = [
+  { id: 'satellite-streets', label: 'Satellite', style: 'mapbox://styles/mapbox/satellite-streets-v12', icon: 'satellite' },
+  { id: 'streets', label: 'Streets', style: 'mapbox://styles/mapbox/streets-v12', icon: 'road' },
+  { id: 'outdoors', label: 'Outdoors', style: 'mapbox://styles/mapbox/outdoors-v12', icon: 'mountain' },
+  { id: 'light', label: 'Light', style: 'mapbox://styles/mapbox/light-v11', icon: 'sun' },
+  { id: 'dark', label: 'Dark', style: 'mapbox://styles/mapbox/dark-v11', icon: 'moon' },
+] as const
+
+export type MapStyleId = typeof MAP_STYLES[number]['id']
+
+interface GuacaMapProps {
+  pins: MapPin[]
+  gapPins?: GapPin[]
+  /** Operator overlays (missions, pending places, spotters, properties, reports). */
+  markers?: OverlayMarker[]
+  selectedMarkerId?: string | null
+  onMarkerClick?: (id: string) => void
+  dots?: MapDot[]
+  heat?: HeatPoint[]
+  countries?: CountryMarker[]
+  zones?: ZoneMarker[]
+  onZoneSelect?: (id: string) => void
+  onCountrySelect?: (code: string) => void
+  /** Every zone's boundary — subtle unselected, bold selected, all tappable. */
+  zoneOutlines?: readonly ZoneOutline[]
+  /** Imperative fly-to; fires when `nonce` changes. */
+  flyTo?: { lat: number; lng: number; zoom?: number; nonce: number }
+  selectedPinId?: string | null
+  selectedGapId?: string | null
+  onPinClick?: (id: string) => void
+  onGapClick?: (id: string) => void
+  onDotClick?: (id: string) => void
+  /** Blue current-location marker with live tracking (GeolocateControl). */
+  showUserLocation?: boolean
+  mapStyle?: MapStyleId
+  center?: [number, number]
+  zoom?: number
+  className?: string
+  style?: React.CSSProperties
+  fallbackImage?: string
+}
+
+import { TAXONOMY } from '@guaca/shared'
+
+const DOTS_SOURCE = 'guaca-dots'
+
+const DOT_FALLBACK_IMAGE = 'guaca-dot-default'
+/** Bitmap edge in device pixels; registered at pixelRatio 2, so 1.0 icon-size = 32 CSS px. */
+const DOT_IMAGE_PX = 64
+
+/**
+ * A candidate dot as a small badge: the category's colour as a translucent
+ * disc, the category's emoji on top. Rasterised to a canvas at runtime
+ * from the one taxonomy definition — the browser draws the emoji in its
+ * own colour font, so it looks exactly like the same glyph on a pin or a
+ * chip — and registered as a sprite image, so the layer stays a GPU
+ * symbol layer. Hundreds of these per viewport cost what hundreds of
+ * circles did; a DOM marker each would not.
+ */
+function renderDotImage(emoji: string, color: string): ImageData | null {
+  if (typeof document === 'undefined') return null
+  const canvas = document.createElement('canvas')
+  canvas.width = DOT_IMAGE_PX
+  canvas.height = DOT_IMAGE_PX
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return null
+  const r = DOT_IMAGE_PX / 2
+  ctx.beginPath()
+  ctx.arc(r, r, r - 3, 0, Math.PI * 2)
+  ctx.fillStyle = color
+  // Translucent on purpose: a candidate is not yet proven, and it must keep
+  // reading as lighter than a pin even now that it carries a glyph.
+  ctx.globalAlpha = 0.78
+  ctx.fill()
+  ctx.globalAlpha = 1
+  ctx.lineWidth = 3
+  ctx.strokeStyle = 'rgba(255,255,255,0.9)'
+  ctx.stroke()
+  ctx.font = `${Math.round(DOT_IMAGE_PX * 0.5)}px sans-serif`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(emoji, r, r + DOT_IMAGE_PX * 0.03)
+  return ctx.getImageData(0, 0, DOT_IMAGE_PX, DOT_IMAGE_PX)
+}
+
+/** Registers every category's badge once per map. Idempotent. */
+function ensureDotImages(map: mapboxgl.Map) {
+  const register = (id: string, emoji: string, color: string) => {
+    if (map.hasImage(id)) return
+    const img = renderDotImage(emoji, color)
+    if (img) map.addImage(id, img, { pixelRatio: 2 })
+  }
+  for (const t of TAXONOMY) register(t.category, t.emoji, t.color)
+  register(DOT_FALLBACK_IMAGE, '📍', '#0C4A5C')
+}
+const HEAT_SOURCE = 'guaca-heat'
+
+/** mapbox-gl's own GeoJSON input type — avoids a @types/geojson dependency. */
+type GeoJsonData = Parameters<mapboxgl.GeoJSONSource['setData']>[0]
+
+function dotsGeoJson(dots: MapDot[]): GeoJsonData {
+  return {
+    type: 'FeatureCollection',
+    features: dots.map((d) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [d.lng, d.lat] },
+      properties: { id: d.id, label: d.label, category: d.category },
+    })),
+  } as GeoJsonData
+}
+
+function heatGeoJson(points: HeatPoint[]): GeoJsonData {
+  return {
+    type: 'FeatureCollection',
+    features: points.map((p) => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: [p.lng, p.lat] },
+      properties: { weight: p.weight },
+    })),
+  } as GeoJsonData
+}
+
+/** (Re)installs the dots + heat sources/layers; safe after style swaps. */
+/**
+ * A zone's boundary on the map. EVERY zone in view gets one — subtle when
+ * unselected, bold and dashed when selected — so a zoomed-in zone always
+ * shows its line and can always be selected (tap the pill, or tap inside
+ * the boundary).
+ */
+export interface ZoneOutline {
+  id: string
+  /** [lonMin, latMin, lonMax, latMax] */
+  bbox: [number, number, number, number]
+  selected?: boolean
+}
+
+const AREA_SOURCE = 'guaca-area'
+
+function zoneOutlinesGeoJson(zones: readonly ZoneOutline[]): { type: 'FeatureCollection'; features: Array<{ type: 'Feature'; properties: { id: string; selected: boolean }; geometry: { type: 'Polygon'; coordinates: number[][][] } }> } {
+  return {
+    type: 'FeatureCollection',
+    features: zones.map((z) => {
+      const [lonMin, latMin, lonMax, latMax] = z.bbox
+      return {
+        type: 'Feature' as const,
+        properties: { id: z.id, selected: z.selected ?? false },
+        geometry: {
+          type: 'Polygon' as const,
+          coordinates: [[
+            [lonMin, latMin], [lonMax, latMin], [lonMax, latMax],
+            [lonMin, latMax], [lonMin, latMin],
+          ]],
+        },
+      }
+    }),
+  }
+}
+
+function installDataLayers(map: mapboxgl.Map, dots: MapDot[], heat: HeatPoint[], zoneOutlines?: readonly ZoneOutline[]) {
+  if (!map.getSource(HEAT_SOURCE)) {
+    map.addSource(HEAT_SOURCE, { type: 'geojson', data: heatGeoJson(heat) })
+    map.addLayer({
+      id: `${HEAT_SOURCE}-layer`,
+      type: 'heatmap',
+      source: HEAT_SOURCE,
+      paint: {
+        'heatmap-weight': ['coalesce', ['get', 'weight'], 0],
+        'heatmap-intensity': 0.8,
+        'heatmap-radius': 42,
+        'heatmap-opacity': 0.45,
+        'heatmap-color': [
+          'interpolate', ['linear'], ['heatmap-density'],
+          0, 'rgba(13,139,139,0)',
+          0.3, 'rgba(13,139,139,0.35)',
+          0.6, 'rgba(212,168,83,0.5)',
+          1, 'rgba(232,115,90,0.65)',
+        ],
+      },
+    })
+  } else {
+    ;(map.getSource(HEAT_SOURCE) as mapboxgl.GeoJSONSource).setData(heatGeoJson(heat))
+  }
+  if (!map.getSource(DOTS_SOURCE)) {
+    ensureDotImages(map)
+    map.addSource(DOTS_SOURCE, { type: 'geojson', data: dotsGeoJson(dots) })
+    map.addLayer({
+      id: `${DOTS_SOURCE}-layer`,
+      type: 'symbol',
+      source: DOTS_SOURCE,
+      layout: {
+        // The feature's category is the image id; anything unmapped falls
+        // back to the generic badge rather than vanishing.
+        'icon-image': ['coalesce', ['image', ['get', 'category']], ['image', DOT_FALLBACK_IMAGE]],
+        // ~13 CSS px at zoom 12, ~22 at 16: legible, still well under a
+        // pin's 32–42, so the "not verified" reading survives.
+        'icon-size': ['interpolate', ['linear'], ['zoom'], 12, 0.4, 16, 0.7, 18, 0.9],
+        // Never drop a candidate to collision avoidance: a dense block of
+        // them is real information (and the click handler still resolves
+        // the topmost one at the tap point).
+        'icon-allow-overlap': true,
+        'icon-ignore-placement': true,
+      },
+    })
+  } else {
+    ;(map.getSource(DOTS_SOURCE) as mapboxgl.GeoJSONSource).setData(dotsGeoJson(dots))
+  }
+  const data = zoneOutlinesGeoJson(zoneOutlines ?? [])
+  if (!map.getSource(AREA_SOURCE)) {
+    map.addSource(AREA_SOURCE, { type: 'geojson', data })
+    // Fill: soft for unselected zones, clearer for the selected one — and
+    // clickable, so tapping inside a zoomed-in zone selects it.
+    map.addLayer({
+      id: `${AREA_SOURCE}-fill`,
+      type: 'fill',
+      source: AREA_SOURCE,
+      filter: ['==', ['get', 'selected'], false],
+      paint: { 'fill-color': '#0D7A72', 'fill-opacity': 0.03 },
+    })
+    map.addLayer({
+      id: `${AREA_SOURCE}-fill-selected`,
+      type: 'fill',
+      source: AREA_SOURCE,
+      filter: ['==', ['get', 'selected'], true],
+      paint: { 'fill-color': '#0D7A72', 'fill-opacity': 0.08 },
+    })
+    map.addLayer({
+      id: `${AREA_SOURCE}-outline`,
+      type: 'line',
+      source: AREA_SOURCE,
+      filter: ['==', ['get', 'selected'], false],
+      paint: { 'line-color': '#0D7A72', 'line-width': 1.2, 'line-opacity': 0.4 },
+    })
+    map.addLayer({
+      id: `${AREA_SOURCE}-outline-selected`,
+      type: 'line',
+      source: AREA_SOURCE,
+      filter: ['==', ['get', 'selected'], true],
+      paint: { 'line-color': '#0D7A72', 'line-width': 2.5, 'line-dasharray': [2, 1.5] },
+    })
+  } else {
+    ;(map.getSource(AREA_SOURCE) as mapboxgl.GeoJSONSource).setData(data)
+  }
+}
+
+/** The Globe mark a public-listing pin carries where a verified pin carries
+ *  its green check — the same glyph the discovery list uses for "listed ·
+ *  unconfirmed", drawn as a badge, never as a checkmark. */
+const LISTED_BADGE_SVG = `<svg width="8.5" height="8.5" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg>`
+
+function createPinHTML(pin: Pick<MapPin, 'emoji' | 'iconSvg' | 'spotterColor' | 'verified' | 'listed' | 'ratingBadge' | 'trendBadge' | 'photoUrl'>, isSelected: boolean) {
+  const { iconSvg, spotterColor: color, verified, listed, ratingBadge, trendBadge, photoUrl } = pin
+  const size = listed ? (isSelected ? 50 : 44) : isSelected ? 46 : 40
+  const border = isSelected ? '3px solid #D97E00' : '2.5px solid #fff'
+  const iconContent = iconSvg
+    ? `<span style="display:flex;align-items:center;justify-content:center">${iconSvg}</span>`
+    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s7-5.8 7-11.3a7 7 0 1 0-14 0C5 15.2 12 21 12 21Z"/><circle cx="12" cy="9.7" r="2.4"/></svg>'
+  // A photo pin keeps the spotter color as its ring-side tail and as the
+  // behind-the-photo fallback; the image layers on top so a failed load
+  // degrades to the ordinary colored pin.
+  // With a photo the face keeps only the category color behind the glyph;
+  // attachPhotoFallback layers the actual <img> over it (and away again if
+  // it fails to load).
+  const face = photoUrl
+    ? `background-color:${color};display:flex;align-items:center;justify-content:center;`
+    : `background: ${color};display:flex;align-items:center;justify-content:center;font-size:${isSelected ? 20 : 17}px;`
+  const inner = iconContent
+  return `
+    <div class="guaca-map-marker" style="
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: ${size}px;
+      cursor: pointer;
+      transition: transform 0.15s ease;
+      filter: drop-shadow(0 2px 6px rgba(0,0,0,0.35));
+    ">
+      <div style="
+        width: ${size}px;
+        height: ${size}px;
+        border-radius: 50%;
+        ${face}
+        border: ${border};
+        box-sizing: border-box;
+      ">${inner}</div>
+      ${ratingBadge && !listed ? `
+      <div style="
+        position: absolute;
+        top: -7px;
+        left: -9px;
+        background: #D97E00;
+        color: white;
+        font-size: 8.5px;
+        font-weight: 800;
+        padding: 1px 5px;
+        border-radius: 8px;
+        white-space: nowrap;
+        border: 1.5px solid white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+      ">★ ${ratingBadge}</div>` : ''}
+      ${trendBadge && !listed ? `
+      <div style="
+        position: absolute;
+        top: -7px;
+        right: -9px;
+        background: #E8735A;
+        color: white;
+        font-size: 9px;
+        font-weight: 800;
+        padding: 1px 5px;
+        border-radius: 8px;
+        white-space: nowrap;
+        border: 1.5px solid white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+      ">${trendBadge === 'trending' ? '🔥' : trendBadge === 'asked_about' ? '❓' : '✨'}</div>` : ''}
+      ${verified ? `
+      <div style="
+        position: absolute;
+        bottom: -1px;
+        right: -1px;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: #22c55e;
+        border: 2px solid white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+      ">
+        <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"></polyline>
+        </svg>
+      </div>` : listed ? `
+      <div style="
+        position: absolute;
+        bottom: -1px;
+        right: -1px;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: #17272B;
+        border: 2px solid white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+      ">${LISTED_BADGE_SVG}</div>` : ''}
+      <div style="
+        width: 0;
+        height: 0;
+        border-left: 6px solid transparent;
+        border-right: 6px solid transparent;
+        border-top: 7px solid ${color};
+        margin-top: -2px;
+      "></div>
+    </div>
+  `
+}
+
+function createGapPinHTML(asks: number, isSelected: boolean) {
+  const size = isSelected ? 42 : 36
+  return `<div class="guaca-map-marker" style="display:flex;flex-direction:column;align-items:center;width:${size}px;cursor:pointer"><div style="width:${size}px;height:${size}px;border-radius:50%;background:rgba(232,115,90,0.9);display:flex;align-items:center;justify-content:center;border:2.5px solid #fff;box-sizing:border-box;box-shadow:0 0 0 4px rgba(232,115,90,0.25),0 2px 8px rgba(0,0,0,0.3);animation:gapPulse 2s ease-in-out infinite"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg></div><div style="position:absolute;top:-8px;right:-8px;background:#E8735A;color:white;font-size:9px;font-weight:700;padding:1px 5px;border-radius:8px;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.2)">${asks}</div><div style="width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid rgba(232,115,90,0.9);margin-top:-2px"></div></div>`
+}
+
+function createOverlayMarkerHTML(m: OverlayMarker, isSelected: boolean) {
+  const size = isSelected ? 38 : 32
+  const fill = m.hollow ? 'rgba(255,255,255,0.92)' : m.color
+  const ring = isSelected ? `0 0 0 4px ${m.color}55, 0 2px 8px rgba(0,0,0,0.3)` : `0 0 0 2px ${m.color}33, 0 2px 6px rgba(0,0,0,0.25)`
+  const badge = m.badge
+    ? `<div style="position:absolute;top:-7px;right:-10px;background:${m.color};color:white;font-size:8.5px;font-weight:800;padding:1px 5px;border-radius:8px;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,0.2);max-width:72px;overflow:hidden;text-overflow:ellipsis">${m.badge}</div>`
+    : ''
+  // No position on the root: mapbox positions marker elements absolutely
+  // through its class, and an inline position would win and stack them in
+  // document flow instead. The badge anchors to the marker element itself.
+  return `<div class="guaca-map-marker" style="display:flex;flex-direction:column;align-items:center;width:${size}px;cursor:pointer"><div style="width:${size}px;height:${size}px;border-radius:50%;background:${fill};display:flex;align-items:center;justify-content:center;border:2.5px solid ${m.hollow ? m.color : '#fff'};box-sizing:border-box;box-shadow:${ring};font-size:${Math.round(size * 0.48)}px;line-height:1">${m.emoji}</div>${badge}<div style="width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid ${m.hollow ? m.color : fill};margin-top:-1px"></div></div>`
+}
+
+/**
+ * Co-located pins rendered on top of each other leave only the upper one
+ * tappable. Fan duplicates within ~11m out on a deterministic golden-angle
+ * spiral (~13m rings): invisible at city zoom, honest at street zoom, and
+ * stable across re-renders because it depends only on input order.
+ */
+function deCollide<T extends { id: string; lat: number; lng: number }>(
+  items: readonly T[],
+): Map<string, [number, number]> {
+  const seen = new Map<string, number>()
+  const out = new Map<string, [number, number]>()
+  for (const p of items) {
+    const key = `${p.lat.toFixed(4)}:${p.lng.toFixed(4)}`
+    const i = seen.get(key) ?? 0
+    seen.set(key, i + 1)
+    if (i === 0) {
+      out.set(p.id, [p.lng, p.lat])
+      continue
+    }
+    const angle = i * 2.399963 // golden angle
+    const r = 0.00012 * Math.sqrt(i)
+    out.set(p.id, [p.lng + r * Math.cos(angle), p.lat + r * Math.sin(angle)])
+  }
+  return out
+}
+
+function makeMarkerInteractive(el: HTMLElement, label: string, activate?: () => void) {
+  el.tabIndex = 0
+  el.setAttribute('role', 'button')
+  el.setAttribute('aria-label', label)
+  el.addEventListener('click', (event) => {
+    event.stopPropagation()
+    activate?.()
+  })
+  el.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    event.stopPropagation()
+    activate?.()
+  })
+}
+
+/** Layers the pin's photograph over the face as a real <img>, so a failed
+ *  load can remove it and reveal the category glyph underneath instead of an
+ *  empty colored disc. The face is the marker's first element. */
+function attachPhotoFallback(markerEl: HTMLElement, photoUrl: string) {
+  const face = markerEl.firstElementChild as HTMLElement | null
+  if (!face) return
+  face.style.position = 'relative'
+  face.style.overflow = 'hidden'
+  const img = document.createElement('img')
+  img.src = photoUrl
+  img.alt = ''
+  img.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;'
+  img.addEventListener('error', () => img.remove(), { once: true })
+  face.appendChild(img)
+}
+
+function createTreasureHTML() {
+  return `
+    <div style="
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      width: 48px;
+      cursor: pointer;
+      filter: drop-shadow(0 0 16px rgba(217,126,0,0.5)) drop-shadow(0 4px 8px rgba(0,0,0,0.3));
+    ">
+      <div style="
+        width: 48px;
+        height: 48px;
+        border-radius: 12px;
+        background: linear-gradient(180deg, #fbbf24, #d97706);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 2px solid rgba(251,191,36,0.6);
+        box-sizing: border-box;
+      "><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/><path d="M12 12v.01"/><path d="M2 12h20"/></svg></div>
+    </div>
+  `
+}
+
+export function GuacaMap({
+  pins,
+  gapPins,
+  markers,
+  selectedMarkerId,
+  onMarkerClick,
+  dots,
+  heat,
+  countries,
+  zones,
+  onZoneSelect,
+  onCountrySelect,
+  zoneOutlines,
+  flyTo,
+  selectedPinId,
+  selectedGapId,
+  onPinClick,
+  onGapClick,
+  onDotClick,
+  showUserLocation = false,
+  mapStyle = 'satellite-streets',
+  center = [-68.0075, 10.4665],
+  zoom = 15,
+  className,
+  style,
+  fallbackImage,
+}: GuacaMapProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<mapboxgl.Map | null>(null)
+  const markersRef = useRef<Map<string, mapboxgl.Marker>>(new Map())
+  // De-collided pin positions — recomputed whenever the pin set changes.
+  const pinPositions = useMemo(() => deCollide(pins), [pins])
+
+  // Public-listing photo markers are a near-street-zoom layer: below z11.5
+  // (basin- and country-level views) the curated set would tile the canvas,
+  // so the backdrop keeps speaking in dots and the featured faces wait for a
+  // closer look. Verified pins are always shown — they are the product's
+  // claim, not its decoration.
+  const LISTED_MIN_ZOOM = 11.5
+  const applyListedVisibility = () => {
+    const map = mapRef.current
+    if (!map) return
+    const show = map.getZoom() >= LISTED_MIN_ZOOM
+    for (const pin of pins) {
+      if (!pin.listed) continue
+      const el = markersRef.current.get(pin.id)?.getElement()
+      if (el) el.style.display = show ? 'flex' : 'none'
+    }
+  }
+
+  const dotsRef = useRef<MapDot[]>(dots ?? [])
+  const zoneOutlinesRef = useRef<readonly ZoneOutline[] | undefined>(zoneOutlines)
+  const heatRef = useRef<HeatPoint[]>(heat ?? [])
+  const onDotClickRef = useRef(onDotClick)
+  dotsRef.current = dots ?? []
+  zoneOutlinesRef.current = zoneOutlines
+  heatRef.current = heat ?? []
+  onDotClickRef.current = onDotClick
+
+  const styleUrl = MAP_STYLES.find(s => s.id === mapStyle)?.style || MAP_STYLES[0].style
+
+  useEffect(() => {
+    if (!MAPBOX_TOKEN || !containerRef.current || mapRef.current) return
+
+    const map = new mapboxgl.Map({
+      container: containerRef.current,
+      style: styleUrl,
+      center,
+      zoom,
+      pitch: 0,
+      bearing: 0,
+      projection: 'mercator',
+      // Attribution is added separately below, in its own corner: sharing
+      // bottom-right with the navigation control made its text overlap
+      // whatever UI sat just above that corner (the coverage card, on a
+      // wide screen) once the control's own CSS offset moved it up to
+      // clear that UI — the offset moved the zoom buttons, not the
+      // attribution strip stacked below them, so it stayed on the seam.
+      attributionControl: false,
+      maxZoom: 19,
+      // The Caribbean is the product: the map must zoom out to the whole
+      // basin (and past it) — country coverage markers live at low zoom.
+      minZoom: 2.5,
+    })
+
+    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-right')
+    map.addControl(new mapboxgl.AttributionControl({ compact: true }), 'top-right')
+
+    let geolocate: mapboxgl.GeolocateControl | null = null
+    if (showUserLocation) {
+      geolocate = new mapboxgl.GeolocateControl({
+        positionOptions: { enableHighAccuracy: true },
+        trackUserLocation: true,
+        showUserHeading: true,
+      })
+      map.addControl(geolocate, 'bottom-right')
+    }
+
+    map.on('load', () => {
+      if (geolocate) geolocate.trigger()
+      // Slightly reduce label opacity for readability
+      const layers = map.getStyle().layers
+      if (layers) {
+        for (const layer of layers) {
+          if (layer.type === 'symbol' && layer.layout) {
+            map.setLayerProperty(layer.id, 'text-opacity', 0.7)
+          }
+        }
+      }
+      installDataLayers(map, dotsRef.current, heatRef.current, zoneOutlinesRef.current)
+    })
+
+    map.on('click', `${DOTS_SOURCE}-layer`, (e) => {
+      const feature = e.features?.[0] as { properties?: { id?: string } } | undefined
+      const id = feature?.properties?.id
+      if (id) onDotClickRef.current?.(id)
+    })
+    map.on('mouseenter', `${DOTS_SOURCE}-layer`, () => {
+      map.getCanvas().style.cursor = 'pointer'
+    })
+    map.on('mouseleave', `${DOTS_SOURCE}-layer`, () => {
+      map.getCanvas().style.cursor = ''
+    })
+
+    mapRef.current = map
+
+    return () => {
+      map.remove()
+      mapRef.current = null
+    }
+  }, [])
+
+  // Swap map style when user selects a different one (skip initial mount)
+  const initialStyleRef = useRef(styleUrl)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || styleUrl === initialStyleRef.current) return
+    map.setStyle(styleUrl)
+    map.once('style.load', () => {
+      // Re-add all markers and data layers after style swap clears them
+      installDataLayers(map, dotsRef.current, heatRef.current, zoneOutlinesRef.current)
+      markersRef.current.forEach((m) => m.remove())
+      markersRef.current.clear()
+
+      pins.forEach((pin) => {
+        const wrapper = document.createElement('div')
+        wrapper.innerHTML = createPinHTML(pin, pin.id === selectedPinId)
+        const el = wrapper.firstElementChild as HTMLElement
+        if (!el) return
+        makeMarkerInteractive(el, pin.label, () => onPinClick?.(pin.id))
+        if (pin.photoUrl) attachPhotoFallback(el, pin.photoUrl)
+        const marker = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat(pinPositions.get(pin.id) ?? [pin.lng, pin.lat])
+          .addTo(map)
+        markersRef.current.set(pin.id, marker)
+      })
+
+      if (gapPins) {
+        gapPins.forEach((gap) => {
+          const wrapper = document.createElement('div')
+          wrapper.innerHTML = createGapPinHTML(gap.asks, gap.id === selectedGapId)
+          const el = wrapper.firstElementChild as HTMLElement
+          if (!el) return
+          makeMarkerInteractive(el, `${gap.label}, requested ${gap.asks} times`, () => onGapClick?.(gap.id))
+          const marker = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+            .setLngLat([gap.lng, gap.lat])
+            .addTo(map)
+          markersRef.current.set(gap.id, marker)
+        })
+      }
+      // Rebuilt elements start visible; restore the street-zoom band.
+      applyListedVisibility()
+    })
+  }, [styleUrl])
+
+  // Update markers
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    // Clear existing markers
+    markersRef.current.forEach((m) => m.remove())
+    markersRef.current.clear()
+
+    pins.forEach((pin) => {
+      const wrapper = document.createElement('div')
+      wrapper.innerHTML = createPinHTML(pin, pin.id === selectedPinId)
+      const el = wrapper.firstElementChild as HTMLElement
+      if (!el) return
+
+      makeMarkerInteractive(el, pin.label, () => onPinClick?.(pin.id))
+      if (pin.photoUrl) attachPhotoFallback(el, pin.photoUrl)
+
+      const marker = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+        .setLngLat(pinPositions.get(pin.id) ?? [pin.lng, pin.lat])
+        .addTo(map)
+
+      markersRef.current.set(pin.id, marker)
+    })
+    applyListedVisibility()
+    map.on('zoom', applyListedVisibility)
+
+    // Add gap markers
+    if (gapPins) {
+      gapPins.forEach((gap) => {
+        const wrapper = document.createElement('div')
+        wrapper.innerHTML = createGapPinHTML(gap.asks, gap.id === selectedGapId)
+        const el = wrapper.firstElementChild as HTMLElement
+        if (!el) return
+
+        makeMarkerInteractive(el, `${gap.label}, requested ${gap.asks} times`, () => onGapClick?.(gap.id))
+
+        const marker = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat([gap.lng, gap.lat])
+          .addTo(map)
+
+        markersRef.current.set(gap.id, marker)
+      })
+    }
+
+    // Operator overlays: fanned apart when they share a spot with each other.
+    if (markers && markers.length > 0) {
+      const spread = deCollide(markers)
+      markers.forEach((m) => {
+        const wrapper = document.createElement('div')
+        wrapper.innerHTML = createOverlayMarkerHTML(m, m.id === selectedMarkerId)
+        const el = wrapper.firstElementChild as HTMLElement
+        if (!el) return
+        makeMarkerInteractive(el, m.label, () => onMarkerClick?.(m.id))
+        const marker = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat(spread.get(m.id) ?? [m.lng, m.lat])
+          .addTo(map)
+        markersRef.current.set(m.id, marker)
+      })
+    }
+
+    return () => {
+      map.off('zoom', applyListedVisibility)
+    }
+  }, [pins, gapPins, markers, selectedPinId, selectedGapId, selectedMarkerId, onPinClick, onGapClick, onMarkerClick])
+
+  // Keep data layers in sync
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !map.isStyleLoaded()) return
+    installDataLayers(map, dots ?? [], heat ?? [], zoneOutlines)
+  }, [dots, heat, zoneOutlines])
+
+  // Country coverage markers — visible only when zoomed out (≤ 5.5).
+  // A country marker is a status claim, never a place pin; zooming in
+  // hands the canvas back to pins and dots.
+  const countryMarkersRef = useRef<Map<string, mapboxgl.Marker>>(new Map())
+  const onCountrySelectRef = useRef(onCountrySelect)
+  onCountrySelectRef.current = onCountrySelect
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    countryMarkersRef.current.forEach((m) => m.remove())
+    countryMarkersRef.current.clear()
+    if (!countries || countries.length === 0) return
+
+    const STATUS_STYLE: Record<CountryMarker['status'], { dot: string; text: string }> = {
+      live: { dot: '#0D7A72', text: '#0D7A72' },
+      planned: { dot: '#D97E00', text: '#8A5A10' },
+      uncovered: { dot: '#9aa5a3', text: '#5f6b69' },
+    }
+    const visibleAtZoom = (z: number) => z <= 5.5
+    const applyVisibility = () => {
+      const show = visibleAtZoom(map.getZoom())
+      countryMarkersRef.current.forEach((m) => {
+        const el = m.getElement()
+        el.style.display = show ? 'flex' : 'none'
+      })
+    }
+
+    for (const c of countries) {
+      const s = STATUS_STYLE[c.status]
+      const wrapper = document.createElement('div')
+      wrapper.style.cssText = `display:flex;flex-direction:column;align-items:center;cursor:pointer;pointer-events:auto;transition:opacity .2s`
+      wrapper.innerHTML = `
+        <div style="display:flex;align-items:center;gap:5px;background:rgba(255,255,255,.93);border:1px solid rgba(23,39,43,.12);border-radius:999px;padding:3px 9px 3px 6px;box-shadow:0 2px 8px rgba(23,39,43,.18)">
+          <span style="width:9px;height:9px;border-radius:50%;background:${s.dot};box-shadow:0 0 0 3px ${s.dot}25"></span>
+          <span style="font:800 11px/1 ui-sans-serif,system-ui;white-space:nowrap;color:#17272B">${c.label}</span>
+        </div>
+        <span style="font:700 9px/1.3 ui-sans-serif,system-ui;white-space:nowrap;color:${s.text};background:rgba(255,255,255,.85);padding:1px 5px;border-radius:6px;margin-top:2px">${c.statusLabel}</span>`
+      const el = wrapper as HTMLElement
+      el.addEventListener('click', (event) => {
+        event.stopPropagation()
+        onCountrySelectRef.current?.(c.code)
+        map.flyTo({ center: [c.lng, c.lat], zoom: 11, duration: 1600 })
+      })
+      const marker = new mapboxgl.Marker({ element: el })
+        .setLngLat([c.lng, c.lat])
+        .addTo(map)
+      countryMarkersRef.current.set(c.code, marker)
+    }
+    applyVisibility()
+    map.on('zoom', applyVisibility)
+    return () => {
+      /* eslint-disable-next-line react-hooks/exhaustive-deps */
+      map.off('zoom', applyVisibility)
+      countryMarkersRef.current.forEach((m) => m.remove())
+      countryMarkersRef.current.clear()
+    }
+  }, [countries])
+
+  // Zone markers — the map-native picker (mid-zoom band). Country markers
+  // cover zoom ≤ 5.5; these take over from there up to street level.
+  const zoneMarkersRef = useRef<Map<string, mapboxgl.Marker>>(new Map())
+  const onZoneSelectRef = useRef(onZoneSelect)
+  onZoneSelectRef.current = onZoneSelect
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+
+    zoneMarkersRef.current.forEach((m) => m.remove())
+    zoneMarkersRef.current.clear()
+    if (!zones || zones.length === 0) return
+
+    // No upper cap: a zoomed-in unselected zone keeps its tappable pill.
+    const visibleAtZoom = (z: number) => z > 5.5
+    const applyVisibility = () => {
+      const show = visibleAtZoom(map.getZoom())
+      zoneMarkersRef.current.forEach((m) => {
+        m.getElement().style.display = show ? 'flex' : 'none'
+      })
+    }
+
+    for (const z of zones) {
+      const wrapper = document.createElement('div')
+      wrapper.style.cssText = `display:flex;align-items:center;cursor:pointer;pointer-events:auto`
+      wrapper.innerHTML = `
+        <div style="display:flex;align-items:center;gap:4px;background:${z.selected ? '#0D7A72' : 'rgba(255,255,255,.93)'};border:1px solid ${z.selected ? '#0D7A72' : 'rgba(23,39,43,.14)'};border-radius:999px;padding:2px 8px 2px 5px;box-shadow:0 2px 6px rgba(23,39,43,.2)">
+          <span style="font-size:9px">${z.selected ? '📍' : '⚪'}</span>
+          <span style="font:800 10px/1.2 ui-sans-serif,system-ui;white-space:nowrap;color:${z.selected ? '#fff' : '#17272B'}">${z.label}</span>
+        </div>`
+      const el = wrapper as HTMLElement
+      el.addEventListener('click', (event) => {
+        event.stopPropagation()
+        onZoneSelectRef.current?.(z.id)
+      })
+      const marker = new mapboxgl.Marker({ element: el })
+        .setLngLat([z.lng, z.lat])
+        .addTo(map)
+      zoneMarkersRef.current.set(z.id, marker)
+    }
+    applyVisibility()
+    map.on('zoom', applyVisibility)
+    return () => {
+      map.off('zoom', applyVisibility)
+      zoneMarkersRef.current.forEach((m) => m.remove())
+      zoneMarkersRef.current.clear()
+    }
+  }, [zones])
+
+  // Tap inside a zone's boundary selects it — the affordance for zones
+  // you're zoomed into, whose centre pill may be off-canvas.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const handler = (e: mapboxgl.MapLayerMouseEvent) => {
+      const f = e.features?.[0] as { properties: { id: string; selected: boolean } } | undefined
+      if (f && !f.properties.selected) onZoneSelectRef.current?.(f.properties.id)
+    }
+    map.on('click', `${AREA_SOURCE}-fill`, handler)
+    return () => {
+      map.off('click', `${AREA_SOURCE}-fill`, handler)
+    }
+  }, [])
+
+  // Imperative fly-to (country/city selection) — nonce-keyed so picking
+  // the same target twice still flies.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !flyTo) return
+    map.flyTo({ center: [flyTo.lng, flyTo.lat], zoom: flyTo.zoom ?? 11, duration: 1500 })
+  }, [flyTo?.nonce])
+
+  // Fly to selected pin
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !selectedPinId) return
+    const pin = pins.find(p => p.id === selectedPinId)
+    if (pin) {
+      map.flyTo({ center: [pin.lng, pin.lat], zoom: map.getZoom(), duration: 600 })
+    }
+  }, [selectedPinId, pins])
+
+  return <div ref={containerRef} className={className} style={{ width: '100%', height: '100%', backgroundImage: fallbackImage ? `url(${fallbackImage})` : undefined, backgroundSize: 'cover', backgroundPosition: 'center', ...style }} />
+}
+
+interface TreasurePin {
+  id: string
+  lat: number
+  lng: number
+  label: string
+}
+
+export function GuacaMapTreasure({
+  pins,
+  center = [-68.0075, 10.4665],
+  zoom = 15,
+  className,
+  style,
+}: {
+  pins: TreasurePin[]
+  center?: [number, number]
+  zoom?: number
+  className?: string
+  style?: React.CSSProperties
+}) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<mapboxgl.Map | null>(null)
+  const pinPositions = useMemo(() => deCollide(pins), [pins])
+
+  useEffect(() => {
+    if (!MAPBOX_TOKEN || !containerRef.current || mapRef.current) return
+
+    const map = new mapboxgl.Map({
+      container: containerRef.current,
+      style: 'mapbox://styles/mapbox/satellite-streets-v12',
+      center,
+      zoom,
+      pitch: 0,
+      bearing: 0,
+      projection: 'mercator',
+      // Same reason as the main map: its own corner, never sharing one
+      // that a card's CSS offset was tuned for the navigation control alone.
+      attributionControl: false,
+      maxZoom: 19,
+      minZoom: 12,
+    })
+
+    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-right')
+    map.addControl(new mapboxgl.AttributionControl({ compact: true }), 'top-right')
+
+    map.on('load', () => {
+      const layers = map.getStyle().layers
+      if (layers) {
+        for (const layer of layers) {
+          if (layer.type === 'symbol' && layer.layout) {
+            map.setLayerProperty(layer.id, 'text-opacity', 0.7)
+          }
+        }
+      }
+
+      pins.forEach((pin) => {
+        const wrapper = document.createElement('div')
+        wrapper.innerHTML = createTreasureHTML()
+        const el = wrapper.firstElementChild as HTMLElement
+        if (!el) return
+
+        new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat(pinPositions.get(pin.id) ?? [pin.lng, pin.lat])
+          .addTo(map)
+      })
+    })
+
+    mapRef.current = map
+
+    return () => {
+      map.remove()
+      mapRef.current = null
+    }
+  }, [])
+
+  return <div ref={containerRef} className={className} style={{ width: '100%', height: '100%', ...style }} />
+}

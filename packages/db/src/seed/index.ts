@@ -1,0 +1,146 @@
+import { createHash } from 'node:crypto';
+import type { Pool } from 'pg';
+import { CARIBBEAN_CITIES } from '@guaca/shared';
+
+const AREA_ID = '00000000-0000-4000-8000-00000000000a';
+
+// Hand-drawn walkable zones for the Puerto Cabello pilot (plan §7.5).
+const ZONES = [
+  { id: 'malecon', name: 'Malecón', access: 0, geom: 'POLYGON((-68.0080 10.4650,-68.0000 10.4650,-68.0000 10.4780,-68.0080 10.4780,-68.0080 10.4650))' },
+  { id: 'casco-historico', name: 'Casco Histórico', access: 0, geom: 'POLYGON((-68.0120 10.4700,-68.0040 10.4700,-68.0040 10.4820,-68.0120 10.4820,-68.0120 10.4700))' },
+  { id: 'playa-quizandal', name: 'Playa Quizandal', access: 1, geom: 'POLYGON((-68.0060 10.4520,-67.9980 10.4520,-67.9980 10.4620,-68.0060 10.4620,-68.0060 10.4520))' },
+  { id: 'borburata', name: 'Borburata', access: 1, geom: 'POLYGON((-68.0200 10.4400,-68.0100 10.4400,-68.0100 10.4500,-68.0200 10.4500,-68.0200 10.4400))' },
+  { id: 'patanemo', name: 'Patanemo', access: 2, geom: 'POLYGON((-68.0280 10.4300,-68.0180 10.4300,-68.0180 10.4400,-68.0280 10.4400,-68.0280 10.4300))' },
+  { id: 'isla-larga', name: 'Isla Larga', access: 2, geom: 'POLYGON((-68.0000 10.4300,-67.9900 10.4300,-67.9900 10.4400,-68.0000 10.4400,-68.0000 10.4300))' },
+  { id: 'centro', name: 'Centro', access: 0, geom: 'POLYGON((-68.0120 10.4650,-68.0040 10.4650,-68.0040 10.4750,-68.0120 10.4750,-68.0120 10.4650))' },
+  { id: 'el-trompillo', name: 'El Trompillo', access: 1, geom: 'POLYGON((-68.0160 10.4550,-68.0080 10.4550,-68.0080 10.4650,-68.0160 10.4650,-68.0160 10.4550))' },
+  { id: 'san-esteban', name: 'San Esteban', access: 1, geom: 'POLYGON((-68.0240 10.4500,-68.0160 10.4500,-68.0160 10.4600,-68.0240 10.4600,-68.0240 10.4500))' },
+  { id: 'la-guaricha', name: 'La Guaricha', access: 0, geom: 'POLYGON((-68.0040 10.4750,-67.9960 10.4750,-67.9960 10.4850,-68.0040 10.4850,-68.0040 10.4750))' },
+];
+
+export const SPOTTERS = [
+  { name: 'Yorman Salazar', phone: '+58 412 000 0001', zone: 'malecon' },
+  { name: 'María Fernanda', phone: '+58 412 000 0002', zone: 'casco-historico' },
+  { name: 'Carlos Pirela', phone: '+58 412 000 0003', zone: 'playa-quizandal' },
+  { name: 'Luisana Contreras', phone: '+58 412 000 0004', zone: 'borburata' },
+  { name: 'José Gregorio', phone: '+58 412 000 0005', zone: 'patanemo' },
+  { name: 'Ana Karina', phone: '+58 412 000 0006', zone: 'isla-larga' },
+  { name: 'Roberto Márquez', phone: '+58 412 000 0007', zone: 'centro' },
+  { name: 'Genesis Villalobos', phone: '+58 412 000 0008', zone: 'el-trompillo' },
+  { name: 'Daniel Lugo', phone: '+58 412 000 0009', zone: 'san-esteban' },
+  { name: 'Paola Marcano', phone: '+58 412 000 0010', zone: 'la-guaricha' },
+];
+
+const PROPERTIES = [
+  { name: 'Posada La Marina', plan: 'paid', qr: 'qr-marina', lon: -68.0065, lat: 10.4720 },
+  { name: 'Villa Quizandal', plan: 'paid', qr: 'qr-quizandal', lon: -68.0020, lat: 10.4570 },
+  { name: 'Casa del Puerto', plan: 'free', qr: 'qr-puerto', lon: -68.0090, lat: 10.4760 },
+];
+
+/**
+ * Seed the pilot: 1 area (Puerto Cabello), walkable zones, 10 curated
+ * spotters (one per zone), and 3 properties (2 paid, 1 free) with QR
+ * tokens. Idempotent — re-running upserts nothing new.
+ */
+export interface SeedOptions {
+  /** Demo spotters, villas and their QR tokens. NEVER true in production —
+   *  they are invented people with fake phone numbers. */
+  demo?: boolean;
+}
+
+/**
+ * `demo: false` (the production default) seeds only the reference geography
+ * — the pilot area and its zones — which the loop needs to attribute
+ * questions and cluster gaps. Real spotters and villas are added by an
+ * operator with `guaca spotter add` / `guaca property add`.
+ */
+export async function seed(pool: Pool, options: SeedOptions = {}): Promise<void> {
+  const demo = options.demo ?? true;
+  await pool.query(
+    `insert into areas (id, name, slug, country, timezone, geom) values
+       ($1, 'Puerto Cabello', 'puerto-cabello', 'VE', 'America/Caracas',
+        ST_GeogFromText('POLYGON((-68.03 10.44,-67.98 10.44,-67.98 10.52,-68.03 10.52,-68.03 10.44))'))
+     on conflict (id) do nothing`,
+    [AREA_ID],
+  );
+
+  for (const zone of ZONES) {
+    await pool.query(
+      `insert into zones (id, area_id, name, geom, access_difficulty) values
+         ($1, $2, $3, ST_GeogFromText($4), $5)
+       on conflict (id) do nothing`,
+      [zone.id, AREA_ID, zone.name, zone.geom, zone.access],
+    );
+  }
+
+  // Caribbean expansion cities as AREAS — reference geography only, no
+  // invented places: they make the multi-region model real, give OSM
+  // candidate imports somewhere to land (`--caribbean-poi`, opt-in), and
+  // cost nothing until a local Spotter actually starts there.
+  for (const city of CARIBBEAN_CITIES) {
+    const { lat, lon, span } = city;
+    // Id derived from the SLUG, not the array position: reordering the
+    // zones (popularity) must never rename an existing area's identity.
+    const id = `00000000-0000-4000-8000-${createHash('sha1')
+      .update(`area:${city.slug}`)
+      .digest('hex')
+      .slice(0, 12)}`;
+    await pool.query(
+      `insert into areas (id, name, slug, country, timezone, geom)
+       select $1, $2, $3, $4, $5, ST_GeogFromText($6)
+        where not exists (select 1 from areas where slug = $3)`,
+      [
+        id,
+        city.name,
+        city.slug,
+        city.countryCode,
+        city.tz ?? 'America/Caracas',
+        `POLYGON((${lon - span} ${lat - span},${lon + span} ${lat - span},${lon + span} ${lat + span},${lon - span} ${lat + span},${lon - span} ${lat - span}))`,
+      ],
+    );
+  }
+
+  // Targeted, idempotent corrections for area rows that predate a researched
+  // fix — the insert above only fires on a fresh database. Keyed by slug,
+  // never by name; each entry states the corrected timezone and bbox so the
+  // area, and every question asked inside it, resolve to the right town.
+  const AREA_CORRECTIONS = [
+    {
+      slug: 'cartagena',
+      timezone: 'America/Bogota',
+      // Researched 2026-09-06: the first frame (10.391, -75.479) centred on
+      // the inner bay and missed the walled city entirely. This frame holds
+      // Centro Histórico, Getsemaní, the Castillo and Bocagrande.
+      geom: 'POLYGON((-75.577 10.3915,-75.517 10.3915,-75.517 10.4515,-75.577 10.4515,-75.577 10.3915))',
+    },
+  ];
+  for (const fix of AREA_CORRECTIONS) {
+    await pool.query(
+      `update areas set timezone = $2, geom = ST_GeogFromText($3)
+        where slug = $1 and (timezone <> $2 or geom <> ST_GeogFromText($3))`,
+      [fix.slug, fix.timezone, fix.geom],
+    );
+  }
+
+  if (!demo) return;
+
+  for (const s of SPOTTERS) {
+    await pool.query(
+      `insert into spotters (name, email, phone, area_id, home_h3, language) values
+         ($1, $2, $3, $4, $5, 'es')
+       on conflict (phone) do update set email = coalesce(spotters.email, excluded.email)`,
+      // Dev logins: "yorman.salazar@spotters.guaca.dev" and so on. Any of
+      // them signs in with 000000 outside production.
+      [s.name, s.name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, '.') + '@spotters.guaca.dev', s.phone, AREA_ID, s.zone],
+    );
+  }
+
+  for (const p of PROPERTIES) {
+    await pool.query(
+      `insert into properties (name, area_id, location, qr_token, plan, subscription_minor, currency) values
+         ($1, $2, ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography, $5, $6, $7, 'USD')
+       on conflict (qr_token) do nothing`,
+      [p.name, AREA_ID, p.lon, p.lat, p.qr, p.plan, p.plan === 'paid' ? 1200 : 0],
+    );
+  }
+}

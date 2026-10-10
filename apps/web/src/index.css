@@ -1,0 +1,89 @@
+@import "tailwindcss";
+@source "../../../packages/ui/src";
+@import "@guaca/ui/theme.css";
+
+/* Landing-only styles below — product styles live in @guaca/ui/theme.css. */
+
+.landing-link {
+  position: relative;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.landing-link::after {
+  content: '';
+  position: absolute;
+  right: 100%;
+  bottom: 5px;
+  left: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--guaca-teal);
+  transition: right 150ms ease-out;
+}
+
+.landing-link:hover::after,
+.landing-link:focus-visible::after {
+  right: 0;
+}
+
+/* Beach-render backdrop: aqua sky settling into warm sand, with faint
+   topographic contours on the right — matching the hero reference art. */
+.landing-hero-glow {
+  background:
+    radial-gradient(circle at 84% 30%, rgba(255, 255, 255, .35), transparent 40%),
+    radial-gradient(circle at 12% 0%, rgba(64, 178, 170, .45), transparent 52%),
+    linear-gradient(168deg, #8fd4cd 0%, #b8e4de 34%, #ecebdd 62%, #f2e7d2 100%);
+}
+
+.landing-hero-contours {
+  background-image: repeating-radial-gradient(
+    circle at 110% 40%,
+    transparent 0,
+    transparent 46px,
+    rgba(255, 255, 255, .5) 47px,
+    transparent 48px
+  );
+  opacity: .5;
+  mask-image: linear-gradient(to left, black 20%, transparent 70%);
+  -webkit-mask-image: linear-gradient(to left, black 20%, transparent 70%);
+}
+
+/* A palm frond casting a soft shadow from the top-left, as in the render. */
+.landing-palm-shadow {
+  filter: blur(14px);
+  opacity: .18;
+  color: #0a4f4a;
+}
+
+.landing-scribble {
+  border-top: 5px solid var(--guaca-coral);
+  border-radius: 50%;
+  transform: rotate(-4deg);
+}
+
+.landing-phone {
+  transform-origin: center bottom;
+  box-shadow: 0 45px 80px rgba(10, 47, 60, .38), 0 18px 30px rgba(10, 47, 60, .22), inset 0 0 0 1px rgba(255,255,255,.18);
+}
+
+.landing-phone-tourist { transform: rotate(-7deg); }
+.landing-phone-spotter { transform: rotate(8deg) scale(.94); }
+
+.landing-island {
+  position: absolute;
+  z-index: 30;
+  top: 10px;
+  left: 50%;
+  width: 88px;
+  height: 23px;
+  border-radius: 999px;
+  background: #050505;
+  transform: translateX(-50%);
+}
+
+@media (max-width: 560px) {
+  .landing-phone-tourist { left: 0; transform: rotate(-7deg) scale(.86); }
+  .landing-phone-spotter { right: -4%; transform: rotate(8deg) scale(.81); }
+}

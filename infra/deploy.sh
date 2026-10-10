@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# GUACA deploy — run on the VM.
+#   ./infra/deploy.sh edge      # shared Caddy (once; re-run on Caddyfile changes)
+#   ./infra/deploy.sh prod      # app stack, project guaca-prod
+#   ./infra/deploy.sh staging   # app stack, project guaca-staging
+# Each tier reads infra/env/<tier>.env (copy from the .example next to it).
+# Seeding demo data is opt-in: SEED=1 ./infra/deploy.sh staging
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+TIER="${1:-prod}"
+
+docker network inspect guaca-edge >/dev/null 2>&1 || docker network create guaca-edge
+
+if [[ "$TIER" == "edge" ]]; then
+  ENV_FILE="infra/env/edge.env"
+  [[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE — copy ${ENV_FILE}.example and fill it"; exit 1; }
+  # --force-recreate: the Caddyfile is a bind mount, so its contents are not
+  # part of the compose config hash — a plain `up -d` would keep the old
+  # container (and Caddy only reads config at startup).
+  docker compose -p guaca-edge --env-file "$ENV_FILE" -f docker-compose.edge.yml up -d --force-recreate
+  docker compose -p guaca-edge -f docker-compose.edge.yml ps
+  exit 0
+fi
+
+if [[ "$TIER" != "prod" && "$TIER" != "staging" ]]; then
+  echo "usage: infra/deploy.sh [edge|prod|staging]"
+  exit 1
+fi
+
+ENV_FILE="infra/env/${TIER}.env"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE — copy ${ENV_FILE}.example and fill it"; exit 1; }
+
+dc() { docker compose -p "guaca-${TIER}" --env-file "$ENV_FILE" -f docker-compose.prod.yml "$@"; }
+
+echo "==> [$TIER] pulling base images"
+# minio only: postgres is built from infra/postgres.Dockerfile (PostGIS + h3)
+# and redis was removed — pulling either fails the deploy.
+dc pull minio
+
+echo "==> [$TIER] building images"
+# Stamp the running container with its commit — /healthz and api.started
+# report it, so "what is live?" never requires guesswork.
+# Code reaches the VM by `git archive`, which carries no .git — so rev-parse
+# there yields "unversioned" and the stamp is useless exactly where it is
+# needed. Let the shipping side pass the sha in.
+GIT_SHA="${GIT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo unversioned)}"
+dc build --build-arg GIT_SHA="$GIT_SHA" postgres api
+
+echo "==> [$TIER] starting stack"
+dc up -d
+
+echo "==> [$TIER] applying migrations"
+dc exec -T api node packages/db/dist/migrate-cli.js
+
+# Reference geography (the pilot area and its zones) always: without it
+# questions have no area and the gap agent cannot cluster. Idempotent.
+echo "==> [$TIER] seeding reference geography"
+dc exec -T api node packages/db/dist/seed-cli.js
+
+if [[ "${SEED:-0}" == "1" ]]; then
+  echo "==> [$TIER] seeding DEMO spotters and villas (SEED=1)"
+  dc exec -T api node packages/db/dist/seed-cli.js --demo
+fi
+
+echo "==> [$TIER] health"
+dc ps

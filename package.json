@@ -1,0 +1,26 @@
+{
+  "name": "guaca-app",
+  "private": true,
+  "packageManager": "pnpm@11.13.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "test:unit": "pnpm -r test:unit",
+    "test:integration": "pnpm -r test:integration",
+    "lint": "pnpm -r lint",
+    "migrate": "pnpm --filter @guaca/db migrate",
+    "seed": "pnpm --filter @guaca/db seed",
+    "seed:puerto-cabello": "pnpm --filter @guaca/db seed:puerto-cabello",
+    "seed:cartagena": "pnpm --filter @guaca/db seed:cartagena",
+    "seed:demo-account": "pnpm --filter @guaca/db seed:demo-account",
+    "seed:scenario": "pnpm --filter @guaca/db seed:scenario",
+    "demo:prepare": "pnpm --filter @guaca/api... build && pnpm migrate && pnpm seed:puerto-cabello && pnpm seed:cartagena && pnpm seed:demo-account",
+    "demo:reset": "pnpm --filter @guaca/db demo:reset",
+    "demo:check": "pnpm --filter @guaca/db demo:check",
+    "demo:rehearse": "pnpm --filter @guaca/db demo:rehearse"
+  }
+}

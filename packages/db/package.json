@@ -1,0 +1,43 @@
+{
+  "name": "@guaca/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b && node -e \"require('fs').cpSync('src/seed/data', 'dist/seed/data', { recursive: true })\"",
+    "test": "pnpm test:unit && pnpm test:integration",
+    "test:unit": "vitest run --config vitest.unit.config.ts --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "migrate": "tsx src/migrate-cli.ts",
+    "seed": "tsx src/seed-cli.ts",
+    "seed:puerto-cabello": "tsx src/seed-puerto-cabello-cli.ts",
+    "seed:cartagena": "tsx src/seed-cartagena-cli.ts",
+    "seed:demo-account": "tsx src/seed-demo-account-cli.ts",
+    "seed:scenario": "tsx src/seed-scenario-cli.ts",
+    "demo:reset": "tsx src/demo-reset-cli.ts",
+    "demo:check": "tsx src/demo-check-cli.ts",
+    "demo:rehearse": "tsx src/demo-rehearse-cli.ts"
+  },
+  "dependencies": {
+    "@guaca/agents": "workspace:*",
+    "@guaca/shared": "workspace:*",
+    "fast-xml-parser": "^4.5.0",
+    "pg": "^8.13.1",
+    "zod": "^3.25.32"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.6"
+  }
+}
