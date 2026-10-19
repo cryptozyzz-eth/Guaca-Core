@@ -8,7 +8,7 @@ import { randomUUID, createHash, timingSafeEqual, randomInt } from 'node:crypto'
 import { SignJWT, jwtVerify } from 'jose';
 import { q, storePhoto, missionsForSpotter, missionsOnSpotterMap, acceptMission, spotterEarnings, sessionForQr, recordRegistration, recordQuestion, upsertTouristLoginCode, consumeTouristLoginCode, touristById, submitPlace, confirmSecondLocal, pendingProvisionalNear, propertyByQrToken, deleteTourist, addPlacePost, postsForPlace, addFavorite, removeFavorite, listFavorites, listTrips, tripById, tripBySlug, deleteTrip, trendsForPlaces, zoneDemand, areaSummaries, unenrichedCandidates, saveDraft, stewardDrafts, approveDraft, rejectDraft, rankedGaps, operatorCommission, listMissions, cancelMission, payMission, addSpotter, listSpotters, issueLoginCode, pendingOperatorQueue, operatorVerify, operatorMapData, recentActivity, operatorConflicts, listIssues, createIssue, resolveIssue,
   upsertOperator, setOperatorLoginCode, consumeOperatorLoginCode, operatorByEmail, listOperators,
-  findSpotterByEmail, setSpotterLoginCode, clearSpotterLoginCode, rewardBalance } from '@guaca/db';
+  findSpotterByEmail, setSpotterLoginCode, clearSpotterLoginCode, rewardBalance, linkSpotterWallet, spotterWallet } from '@guaca/db';
 import { createObjectStore, type ObjectStore } from './objectStore.js';
 import { runSubmissionVerification, confirmAllowed } from './verificationService.js';
 import { registerScenarioApi } from './scenarioApi.js';
@@ -2026,7 +2026,22 @@ export function buildApp(options: AppOptions): FastifyInstance {
       level: row.level,
       totalPoints: points,
       rewardBalance: points,
+      payoutsActive: (await spotterWallet(options.pool, spotterId)) !== null,
     };
+  });
+
+  // Demo (testnet): the spotter activates payouts from the app; Pollar creates
+  // the wallet and the app reports its address, which we link to the signed-in
+  // spotter (demo: not verified against Pollar — see pollar.ts).
+  app.post('/api/spotter/wallet', async (req, reply) => {
+    const token = tokenFrom(req, 'guaca_spotter');
+    if (!token) return reply.code(401).send({ error: 'unauthorized' });
+    const { spotterId } = await verifySpotterToken(token, sessionSecret());
+    if (!spotterId) return reply.code(401).send({ error: 'unauthorized' });
+    const body = (req.body ?? {}) as { address?: string; pollarUserId?: string };
+    const ok = await linkSpotterWallet(options.pool, spotterId, body.address ?? '', body.pollarUserId ?? null);
+    if (!ok) return reply.code(400).send({ error: 'invalid wallet' });
+    return { ok: true };
   });
 
   // Provisional places by OTHER spotters near the caller — the L6 worklist.

@@ -9,6 +9,10 @@ import { runTravellerTick } from './travellerTick.js';
 import { recomputeTrends } from './trendsService.js';
 import { disabledWeatherProvider, openMeteoProvider } from './weather.js';
 
+import { assertPollarTestnet } from './pollar.js';
+
+assertPollarTestnet();
+
 const contextProvider = (process.env.WEATHER_ENABLED ?? 'true') !== 'false' ? liveContextProvider() : disabledContextProvider();
 const router = routerFromEnv();
 const app = buildApp({ pool, contextProvider, router });

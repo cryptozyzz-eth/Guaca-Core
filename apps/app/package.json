@@ -16,6 +16,7 @@
   "dependencies": {
     "@guaca/shared": "workspace:*",
     "@guaca/ui": "workspace:*",
+    "@pollar/react": "^0.11.5",
     "lucide-react": "^0.563.0",
     "next": "^15.1.0",
     "qrcode": "^1.5.4",

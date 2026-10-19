@@ -7,6 +7,8 @@ export interface EarningRow {
   rewardMinor: number;
   currency: string;
   payoutStatus: string | null;
+  /** Set only when the payout settled on-chain (testnet demo rail). */
+  txHash: string | null;
   paidAt: Date | null;
 }
 
@@ -17,7 +19,7 @@ export async function spotterEarnings(
 ): Promise<EarningRow[]> {
   const res = await pool.query(
     `select m.id as "missionId", m.brief, m.status, m.reward_minor as "rewardMinor",
-            m.currency, p.status as "payoutStatus", p.created_at as "paidAt"
+            m.currency, p.status as "payoutStatus", p.tx_hash as "txHash", p.created_at as "paidAt"
      from missions m
      left join payouts p on p.mission_id = m.id
      where m.spotter_id = $1

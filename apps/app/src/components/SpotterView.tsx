@@ -6,6 +6,7 @@ import { appCopy } from '../lib/copy'
 import { photoToBase64 } from '../lib/image'
 import { VENUE_TZ } from '../lib/scenarioActors'
 import { InstallApp } from './InstallApp'
+import { PayoutsCard } from './PayoutsCard'
 import { RailArt } from './RailArt'
 import { MobileViewport } from './MobileViewport'
 
@@ -100,6 +101,7 @@ interface Earning {
   rewardMinor: number
   currency: string
   payoutStatus: string | null
+  txHash?: string | null
 }
 
 interface SpotterMe {
@@ -110,6 +112,7 @@ interface SpotterMe {
   photoUrl: string | null
   level: number
   totalPoints: number
+  payoutsActive?: boolean
 }
 
 interface RankRow {
@@ -1470,6 +1473,8 @@ export function SpotterView() {
               </div>
             </div>
 
+            <PayoutsCard active={me?.payoutsActive === true} onLinked={loadProfile} lang={lang === 'es' ? 'es' : 'en'} />
+
             {/* Points history */}
             <p className="px-1 text-[11px] font-black uppercase tracking-[.1em] text-guaca-ink/50">{t.historyTitle}</p>
             {earnings.length === 0 && (
@@ -1485,7 +1490,19 @@ export function SpotterView() {
                     {statusLabel[e.status] ?? e.status}
                   </p>
                 </div>
-                <span className="shrink-0 text-[13px] font-black text-guaca-palm">{pts(e.rewardMinor)}</span>
+                <span className="shrink-0 text-right text-[13px] font-black text-guaca-palm">
+                  {pts(e.rewardMinor)}
+                  {e.txHash && (
+                    <a
+                      href={`https://stellar.expert/explorer/testnet/tx/${e.txHash}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-0.5 block text-[10px] font-black text-guaca-teal underline-offset-2 hover:underline"
+                    >
+                      {lang === 'es' ? `Cobrado $${(e.rewardMinor / 100).toFixed(2)} · Ver comprobante` : `Paid $${(e.rewardMinor / 100).toFixed(2)} · View receipt`}
+                    </a>
+                  )}
+                </span>
               </article>
             ))}
             {/* Mode switch — mirrors the tourist profile's card; the map

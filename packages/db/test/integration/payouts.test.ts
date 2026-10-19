@@ -85,4 +85,22 @@ describe('payMission (T5.8)', () => {
     );
     expect(rows.rows[0]!.n).toBe(1);
   });
+
+  it('refuses to pay a mission that is not verified', async () => {
+    const other = '00000000-0000-4000-8000-0000000000f3';
+    const gap = '00000000-0000-4000-8000-0000000000f4';
+    await pool.query(
+      `insert into gaps (id, area_id, category, h3_8) values ($1, $2, 'eat_drink', '8a0000000000001')`,
+      [gap, AREA_ID],
+    );
+    await pool.query(
+      `insert into missions (id, gap_id, spotter_id, brief, target_category, target_h3, reward_minor, status, created_by, expires_at)
+       values ($1, $2, $3, 'brief', 'eat_drink', '8a0000000000001', 300, 'offered', 'agent', now() + interval '48 hours')`,
+      [other, gap, SPOTTER_ID],
+    );
+    const r = await payMission(pool, { ...payInput, missionId: other });
+    expect(r.status).toBe('failed');
+    const rows = await pool.query('select count(*)::int as n from payouts where mission_id = $1', [other]);
+    expect(rows.rows[0]!.n).toBe(0);
+  });
 });
