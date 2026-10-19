@@ -104,6 +104,15 @@ const MEDELLIN: CitySpec = {
 
 /** Cartagena places that already exist (imported by seedCartagena) but have no public profile. */
 const CARTAGENA_EXTRA_PROFILES: Record<string, unknown> = {
+  'La Popa Mirador': {
+    demo: true, researchedAt: '2026-10-19',
+    summary: {
+      en: 'Cerro de la Popa is the highest hill in Cartagena, with the Convento de Santa Cruz de la Popa at the top and wide views over the city and the bay.',
+      es: 'El Cerro de la Popa es la colina más alta de Cartagena, con el Convento de Santa Cruz de la Popa en la cima y amplias vistas de la ciudad y la bahía.',
+    },
+    image: { url: '/demo/cartagena/convento-de-la-popa.jpg', credit: "Mariordo (Mario Roberto Durán Ortiz) / Wikimedia Commons · 2019", sourceUrl: "https://commons.wikimedia.org/wiki/File:Convento_de_la_Popa_CTG_11_2019_1871.jpg", license: "CC BY-SA 4.0", licenseUrl: "https://creativecommons.org/licenses/by-sa/4.0" },
+    sources: [{ label: 'Wikipedia: Convento de la Popa', url: 'https://es.wikipedia.org/wiki/Convento_de_la_Popa' }],
+  },
   'Fuerte de San Sebastián del Pastelillo': {
     demo: true, researchedAt: '2026-10-19',
     summary: {
@@ -133,6 +142,8 @@ const CARTAGENA: CitySpec = {
     { key: 'ctg-5', place: "Bembe De Getsemani - Bar", category: 'eat_drink', kind: 'hours', status: 'offered', owner: 1, brief: 'Confirm the opening time of Bembé in Getsemaní and whether there is a cover charge.', reward: 160 },
     { key: 'ctg-6', place: 'La Brioche Bocagrande', category: 'eat_drink', kind: 'hours', status: 'accepted', owner: 0, brief: 'Confirm breakfast hours at La Brioche in Bocagrande and whether they accept cards.', reward: 120 },
     { key: 'ctg-8', place: 'Fuerte de San Sebastián del Pastelillo', category: 'culture_history', kind: 'access', status: 'offered', owner: 1, brief: 'Check whether visitors can walk up to the Fuerte de San Sebastián del Pastelillo today, which entrance is used, and whether the Club de Pesca restricts access.', reward: 200 },
+    { key: 'ctg-9', place: 'La Popa Mirador', category: 'nature_walk', kind: 'access', status: 'offered', owner: 0, brief: 'Check how visitors get up Cerro de la Popa today, the opening hours and entry fee at the Convento de la Popa, and whether the viewpoint is open.', reward: 250 },
+    { key: 'ctg-10', place: 'Parque Espiritu del Manglar', category: 'nature_walk', kind: 'hours', status: 'offered', owner: 1, brief: 'Confirm the opening hours of Parque Espíritu del Manglar in Chambacú, whether entry is free, and whether the pier over the lagoon is open today.', reward: 180 },
     { key: 'ctg-7', place: 'castillo san Felipe viewpoint', category: 'nature_walk', kind: 'evidence', status: 'verified', owner: 1, brief: 'Photograph the view from the Castillo San Felipe viewpoint and the path leading to it.', reward: 300 },
   ],
 };

@@ -30,3 +30,4 @@ CC BY-SA 3.0 https://creativecommons.org/licenses/by-sa/3.0 ·
 CC BY-SA 2.0 https://creativecommons.org/licenses/by-sa/2.0 ·
 CC BY 2.0 https://creativecommons.org/licenses/by/2.0
 | fuerte-pastelillo.jpg | Fuerte de San Sebastián del Pastelillo from the Manga side | Ivonne Correa, 2012 | https://commons.wikimedia.org/wiki/File:Fuerte_de_San_Sebasti%C3%A1n_del_Pastelillo.JPG | CC BY-SA 3.0 |
+| convento-de-la-popa.jpg | Convento de Santa Cruz de la Popa on Cerro de la Popa | Mariordo (Mario Roberto Durán Ortiz), 2019 | https://commons.wikimedia.org/wiki/File:Convento_de_la_Popa_CTG_11_2019_1871.jpg | CC BY-SA 4.0 |
