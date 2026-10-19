@@ -1245,9 +1245,17 @@ export function buildApp(options: AppOptions): FastifyInstance {
     if (!existing) {
       return reply.code(403).send({ error: 'this email is not registered as an operator' });
     }
-    const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+    // DEMO/DEV: outside production the operator code is always 000000, like the
+    // spotter and merchant logins. The random code below is kept for production.
+    const code =
+      process.env.NODE_ENV !== 'production'
+        ? '000000'
+        : // const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+          String(randomInt(0, 1_000_000)).padStart(6, '0');
     const codeHash = createHash('sha256').update(code).digest('hex');
-    await setOperatorLoginCode(options.pool, email, codeHash, new Date(Date.now() + 10 * 60_000));
+    // DEMO/DEV: the fixed 000000 code lasts 30 minutes; production keeps 10.
+    const codeTtlMs = process.env.NODE_ENV !== 'production' ? 30 * 60_000 : 10 * 60_000;
+    await setOperatorLoginCode(options.pool, email, codeHash, new Date(Date.now() + codeTtlMs));
     const sender = emailSender ?? createEmailSender();
     if (sender.mode === 'dev') {
       console.log(`[operator-auth] login code for ${email}: ${code}`);

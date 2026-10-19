@@ -102,6 +102,19 @@ const MEDELLIN: CitySpec = {
   ],
 };
 
+/** Cartagena places that already exist (imported by seedCartagena) but have no public profile. */
+const CARTAGENA_EXTRA_PROFILES: Record<string, unknown> = {
+  'Fuerte de San Sebastián del Pastelillo': {
+    demo: true, researchedAt: '2026-10-19',
+    summary: {
+      en: 'Colonial fort on the Manga waterfront, at the entrance of the bay. It is part of the historic defences of Cartagena and today houses the Club de Pesca.',
+      es: 'Fuerte colonial en el borde de Manga, a la entrada de la bahía. Hace parte de las antiguas defensas de Cartagena y hoy alberga el Club de Pesca.',
+    },
+    image: { url: '/demo/cartagena/fuerte-pastelillo.jpg', credit: "Ivonne Correa / Wikimedia Commons · 2012", sourceUrl: "https://commons.wikimedia.org/wiki/File:Fuerte_de_San_Sebasti%C3%A1n_del_Pastelillo.JPG", license: "CC BY-SA 3.0", licenseUrl: "https://creativecommons.org/licenses/by-sa/3.0" },
+    sources: [{ label: 'Wikipedia: Fuerte de San Sebastián del Pastelillo', url: 'https://es.wikipedia.org/wiki/Fuerte_de_San_Sebasti%C3%A1n_del_Pastelillo' }],
+  },
+};
+
 const CARTAGENA: CitySpec = {
   slug: 'cartagena',
   name: 'Cartagena',
@@ -119,6 +132,7 @@ const CARTAGENA: CitySpec = {
     { key: 'ctg-4', place: 'Plaza de los coches', category: 'market_shop', kind: 'evidence', status: 'offered', owner: 1, brief: 'Photograph the Plaza de los Coches from the Torre del Reloj gate so a visitor can recognise it.', reward: 140 },
     { key: 'ctg-5', place: "Bembe De Getsemani - Bar", category: 'eat_drink', kind: 'hours', status: 'offered', owner: 1, brief: 'Confirm the opening time of Bembé in Getsemaní and whether there is a cover charge.', reward: 160 },
     { key: 'ctg-6', place: 'La Brioche Bocagrande', category: 'eat_drink', kind: 'hours', status: 'accepted', owner: 0, brief: 'Confirm breakfast hours at La Brioche in Bocagrande and whether they accept cards.', reward: 120 },
+    { key: 'ctg-8', place: 'Fuerte de San Sebastián del Pastelillo', category: 'culture_history', kind: 'access', status: 'offered', owner: 1, brief: 'Check whether visitors can walk up to the Fuerte de San Sebastián del Pastelillo today, which entrance is used, and whether the Club de Pesca restricts access.', reward: 200 },
     { key: 'ctg-7', place: 'castillo san Felipe viewpoint', category: 'nature_walk', kind: 'evidence', status: 'verified', owner: 1, brief: 'Photograph the view from the Castillo San Felipe viewpoint and the path leading to it.', reward: 300 },
   ],
 };
@@ -170,6 +184,13 @@ async function ensurePlace(pool: Pool, areaId: string, p: PlaceSpec): Promise<vo
 async function seedCity(pool: Pool, city: CitySpec): Promise<{ missions: number; spotters: number }> {
   const areaId = await ensureArea(pool, city);
   for (const p of city.places) await ensurePlace(pool, areaId, p);
+  if (city.slug === 'cartagena') {
+    for (const [name, profile] of Object.entries(CARTAGENA_EXTRA_PROFILES)) {
+      await pool.query(`update places set public_profile = $3::jsonb where area_id = $1 and name = $2 and public_profile is null`, [
+        areaId, name, JSON.stringify(profile),
+      ]);
+    }
+  }
   const spotterIds = [] as string[];
   for (const s of city.spotters) spotterIds.push(await ensureSpotter(pool, s, areaId));
 
