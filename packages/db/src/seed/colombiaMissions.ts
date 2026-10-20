@@ -18,7 +18,7 @@ interface MissionSpec {
   category: string;
   kind: Kind;
   status: Status;
-  owner: 0 | 1;
+  owner: 0 | 1 | 2;
   brief: string;
   reward: number;
 }
@@ -29,7 +29,7 @@ interface CitySpec {
   timezone: string;
   bbox: [number, number, number, number]; // lonMin, latMin, lonMax, latMax
   places: PlaceSpec[]; // created if missing
-  spotters: [SpotterSpec, SpotterSpec];
+  spotters: SpotterSpec[];
   missions: MissionSpec[];
 }
 
@@ -133,6 +133,7 @@ const CARTAGENA: CitySpec = {
   spotters: [
     { key: 'ctg-valentina', name: 'Valentina Ospino', email: 'valentina.ospino@demo.guaca.live', phone: '+57 300 000 0111', lat: 10.4236, lon: -75.5494 },
     { key: 'ctg-julian', name: 'Julián Barrios', email: 'julian.barrios@demo.guaca.live', phone: '+57 300 000 0112', lat: 10.4225, lon: -75.5446 },
+    { key: 'ctg-daniela', name: 'Daniela Marrugo', email: 'daniela.marrugo@demo.guaca.live', phone: '+57 300 000 0113', lat: 10.4236, lon: -75.5494 },
   ],
   missions: [
     { key: 'ctg-1', place: 'Castillo San Felipe de Barajas', category: 'culture_history', kind: 'hours', status: 'offered', owner: 0, brief: 'Confirm the ticket-window hours at the Castillo San Felipe de Barajas and the last entry time.', reward: 250 },
@@ -144,6 +145,7 @@ const CARTAGENA: CitySpec = {
     { key: 'ctg-8', place: 'Fuerte de San Sebastián del Pastelillo', category: 'culture_history', kind: 'access', status: 'offered', owner: 1, brief: 'Check whether visitors can walk up to the Fuerte de San Sebastián del Pastelillo today, which entrance is used, and whether the Club de Pesca restricts access.', reward: 200 },
     { key: 'ctg-9', place: 'La Popa Mirador', category: 'nature_walk', kind: 'access', status: 'offered', owner: 0, brief: 'Check how visitors get up Cerro de la Popa today, the opening hours and entry fee at the Convento de la Popa, and whether the viewpoint is open.', reward: 250 },
     { key: 'ctg-10', place: 'Parque Espiritu del Manglar', category: 'nature_walk', kind: 'hours', status: 'offered', owner: 1, brief: 'Confirm the opening hours of Parque Espíritu del Manglar in Chambacú, whether entry is free, and whether the pier over the lagoon is open today.', reward: 180 },
+    { key: 'ctg-11', place: 'Puerta del Reloj', category: 'culture_history', kind: 'evidence', status: 'verified', owner: 2, brief: 'Photograph the Torre del Reloj gate from Plaza de los Coches and note whether the entrance is open to pedestrians.', reward: 300 },
     { key: 'ctg-7', place: 'castillo san Felipe viewpoint', category: 'nature_walk', kind: 'evidence', status: 'verified', owner: 1, brief: 'Photograph the view from the Castillo San Felipe viewpoint and the path leading to it.', reward: 300 },
   ],
 };
